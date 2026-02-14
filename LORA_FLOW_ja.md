@@ -59,7 +59,49 @@ cd E:\Python\MioTTS-Inference
   --dtype bf16
 ```
 
-## 4) 推論サーバで使う
+## 4) LoRA込みモデルをGGUF化（llama.cpp用）
+
+```powershell
+cd E:\Python\MioTTS-Inference
+if (!(Test-Path .\third_party\llama.cpp)) {
+  git clone --depth 1 https://github.com/ggml-org/llama.cpp .\third_party\llama.cpp
+}
+
+.\.venv\Scripts\python.exe .\third_party\llama.cpp\convert_hf_to_gguf.py `
+  "E:\Python\MioTTS-Inference\models\MioTTS-2.6B-lora-test1" `
+  --outtype bf16 `
+  --outfile "E:\Python\MioTTS-Inference\models\MioTTS-2.6B-lora-test1-BF16.gguf" `
+  --use-temp-file
+```
+
+## 4-2) マージせずにLoRAをランタイム適用（推奨）
+
+モデルを毎回マージせず、ベースGGUF + LoRA GGUFを起動時に重ねて使う方法。
+
+### 4-2-1) LoRA adapterをGGUF化
+
+```powershell
+.\.venv\Scripts\python.exe .\third_party\llama.cpp\convert_lora_to_gguf.py `
+  "E:\Python\MioTTS-Inference\outputs\lora_test1_attn" `
+  --base "E:\Python\MioTTS-Inference\models\MioTTS-2.6B" `
+  --outtype bf16 `
+  --outfile "E:\Python\MioTTS-Inference\outputs\lora_test1_attn\adapter-lora-bf16.gguf"
+```
+
+### 4-2-2) llama-server起動時にLoRA適用
+
+`--special` は MioTTS で必須。
+
+```powershell
+"C:\Users\kenta\AppData\Local\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama-server.exe" `
+  -m "E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf" `
+  --lora "E:\Python\MioTTS-Inference\outputs\lora_test1_attn\adapter-lora-bf16.gguf" `
+  --special `
+  --port 8000 `
+  -c 8192 --cont-batching --batch_size 8
+```
+
+## 5) 推論サーバで使う
 
 WSL/Linux の vLLM 例:
 
@@ -73,10 +115,9 @@ vllm serve /mnt/e/Python/MioTTS-Inference/models/MioTTS-2.6B-lora-test1 --max-mo
 .\.venv\Scripts\python.exe .\run_server.py --llm-base-url http://localhost:8000/v1
 ```
 
-## 5) うまくいかない場合の調整
+## 6) うまくいかない場合の調整
 
 - まず増やす: `--epochs`（2 -> 3）, `--save-steps` を小さくして中間確認
 - 過学習気味: `--learning-rate` を下げる（`2e-4 -> 1e-4`）
 - 効きが弱い: `--target-modules` に `w1,w2,w3` を追加して再学習
 - VRAM不足: `--max-length` を `1024` へ下げる / 勾配蓄積を増やす
-

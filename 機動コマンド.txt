@@ -1,5 +1,11 @@
 llama-server -m E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf -c 8192 --cont-batching --batch_size 8 --port 8000
 
+llama-server `
+  -m "E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf" `
+  --lora "E:\Python\MioTTS-Inference\outputs\lora_test1_attn\adapter-lora-bf16.gguf" `
+  --special `
+  --port 8000 -c 8192 --cont-batching --batch_size 8
+
 uv run run_server.py --llm-base-url http://localhost:8000/v1 --best-of-n-enabled
 
 uv run run_gradio.py
