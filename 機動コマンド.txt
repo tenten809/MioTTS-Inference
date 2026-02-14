@@ -1,0 +1,5 @@
+llama-server -m E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf -c 8192 --cont-batching --batch_size 8 --port 8000
+
+uv run run_server.py --llm-base-url http://localhost:8000/v1 --best-of-n-enabled
+
+uv run run_gradio.py
