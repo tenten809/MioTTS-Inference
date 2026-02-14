@@ -75,15 +75,18 @@ class MioCodecService:
         if reference_waveform is None and global_embedding is None:
             raise ValueError("Either reference_waveform or global_embedding is required.")
 
+        device = _codec_device(self.codec)
+
         # Extract global embedding from reference waveform if provided
         if reference_waveform is not None:
+            reference_waveform = _prepare_reference_waveform(reference_waveform, device)
             ref_features = self.codec.encode(reference_waveform, return_content=False, return_global=True)
             global_embedding = ref_features.global_embedding
 
         if isinstance(tokens, list):
-            tokens = torch.tensor(tokens, dtype=torch.long, device=_codec_device(self.codec))
-        elif isinstance(tokens, torch.Tensor) and tokens.dtype != torch.long:
-            tokens = tokens.long()
+            tokens = torch.tensor(tokens, dtype=torch.long, device=device)
+        elif isinstance(tokens, torch.Tensor):
+            tokens = tokens.long().to(device)
         return self.codec.decode(
             global_embedding=global_embedding,
             content_token_indices=tokens,
@@ -106,6 +109,7 @@ class MioCodecService:
 
         # Extract global embedding from reference waveform if provided
         if reference_waveform is not None:
+            reference_waveform = _prepare_reference_waveform(reference_waveform, device)
             ref_features = self.codec.encode(reference_waveform, return_content=False, return_global=True)
             global_embedding = ref_features.global_embedding
         token_tensors = []
@@ -193,6 +197,19 @@ def _prepare_embedding(embedding: Any, device: torch.device | str) -> torch.Tens
     if embedding.dim() != 1:
         embedding = embedding.flatten()
     return embedding.to(device)
+
+
+def _prepare_reference_waveform(
+    waveform: Any, device: torch.device | str
+) -> torch.Tensor:
+    if isinstance(waveform, np.ndarray):
+        waveform = torch.from_numpy(waveform)
+    if not isinstance(waveform, torch.Tensor):
+        waveform = torch.tensor(waveform)
+    waveform = waveform.squeeze()
+    if waveform.dim() != 1:
+        waveform = waveform.flatten()
+    return waveform.to(device=device, dtype=torch.float32)
 
 
 def _codec_device(codec: MioCodecModel) -> torch.device:
