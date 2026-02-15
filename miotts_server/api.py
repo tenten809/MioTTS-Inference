@@ -46,6 +46,7 @@ async def lifespan(app: FastAPI):
     )
     codec_service = MioCodecService(
         model_id=config.codec_model_id,
+        adapter_path=config.codec_adapter_path,
         device=config.device,
         presets_dir=config.presets_dir,
     )

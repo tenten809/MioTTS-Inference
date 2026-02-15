@@ -42,6 +42,7 @@ class ServerConfig:
     llm_model: str | None
     llm_timeout: float
     codec_model_id: str
+    codec_adapter_path: str | None
     device: str
     max_text_length: int
     presets_dir: Path
@@ -99,6 +100,7 @@ def get_config() -> ServerConfig:
             llm_model=os.getenv("MIOTTS_LLM_MODEL"),
             llm_timeout=_env_float("MIOTTS_LLM_TIMEOUT", 120.0),
             codec_model_id=os.getenv("MIOTTS_CODEC_MODEL", "Aratako/MioCodec-25Hz-24kHz"),
+            codec_adapter_path=os.getenv("MIOTTS_CODEC_ADAPTER"),
             device=device,
             max_text_length=_env_int("MIOTTS_MAX_TEXT_LENGTH", 300),
             presets_dir=presets_dir,

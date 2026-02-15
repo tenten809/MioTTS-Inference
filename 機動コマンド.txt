@@ -1,8 +1,8 @@
 llama-server -m E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf -c 8192 --cont-batching --batch_size 8 --port 8000
 
 llama-server `
-  -m "E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf" `
-  --lora "E:\Python\MioTTS-Inference\outputs\lora_test1_attn\adapter-lora-bf16.gguf" `
+  -m ".\models\MioTTS-2.6B-BF16.gguf" `
+  --lora-scaled ".\outputs\lora_test2_attn_rank32\adapter-lora-bf16_2.gguf:1.0" `
   --special `
   --port 8000 -c 8192 --cont-batching --batch_size 8
 

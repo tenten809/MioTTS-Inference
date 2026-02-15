@@ -22,10 +22,12 @@ class MioCodecService:
     def __init__(
         self,
         model_id: str,
+        adapter_path: str | None,
         device: str,
         presets_dir: Path,
     ) -> None:
         self._model_id = model_id
+        self._adapter_path = adapter_path
         self._device = device
         self._presets_dir = presets_dir
         self._codec: MioCodecModel | None = None
@@ -34,6 +36,7 @@ class MioCodecService:
     def load(self) -> None:
         logger.info("Loading MioCodec model: %s", self._model_id)
         codec = MioCodecModel.from_pretrained(self._model_id)
+        self._apply_adapter(codec)
         codec = codec.eval().to(self._device)
         self._codec = codec
 
@@ -166,6 +169,32 @@ class MioCodecService:
             if path.exists():
                 return PresetEntry(preset_id=preset_id, path=path)
         raise FileNotFoundError(f"Preset '{preset_id}' not found in {base_dir}.")
+
+    def _apply_adapter(self, codec: MioCodecModel) -> None:
+        if not self._adapter_path:
+            return
+        adapter = Path(self._adapter_path).expanduser().resolve()
+        if not adapter.exists():
+            raise FileNotFoundError(f"MioCodec adapter not found: {adapter}")
+
+        logger.info("Loading MioCodec adapter: %s", adapter)
+        if adapter.suffix.lower() == ".safetensors":
+            from safetensors.torch import load_file
+
+            state_dict = load_file(str(adapter), device="cpu")
+        else:
+            state_dict = torch.load(adapter, map_location="cpu", weights_only=True)
+
+        result = codec.load_state_dict(state_dict, strict=False)
+        missing = list(getattr(result, "missing_keys", []))
+        unexpected = list(getattr(result, "unexpected_keys", []))
+        logger.info(
+            "MioCodec adapter loaded (missing=%d, unexpected=%d)",
+            len(missing),
+            len(unexpected),
+        )
+        if unexpected:
+            logger.warning("Unexpected adapter keys: %s", unexpected[:10])
 
 
 def _load_embedding_from_path(path: Path) -> Any:

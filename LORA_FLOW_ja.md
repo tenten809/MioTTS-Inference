@@ -33,21 +33,24 @@ cd E:\Python\MioTTS-Inference
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\train_lora.py `
   --base-model "E:\Python\MioTTS-Inference\models\MioTTS-2.6B" `
-  --train-jsonl "E:\Python\MioTTS-Inference\data\test1\train_lora.jsonl" `
-  --output-dir "E:\Python\MioTTS-Inference\outputs\lora_test1_attn" `
-  --target-modules "q_proj,k_proj,v_proj,out_proj" `
-  --lora-r 16 `
-  --lora-alpha 32 `
-  --lora-dropout 0.05 `
+  --train-jsonl "E:\Python\MioTTS-Inference\data\test2\train_lora.jsonl" `
+  --output-dir "E:\Python\MioTTS-Inference\outputs\lora_test2_attn_rank32" `
+  --target-modules "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.out_proj" `
+  --lora-r 32 `
+  --lora-alpha 64 `
+  --lora-dropout 0.1 `
   --max-length 2048 `
-  --epochs 2 `
-  --learning-rate 2e-4 `
-  --train-batch-size 1 `
+  --epochs 10 `
+  --learning-rate 1e-4 `
+  --weight-decay 0.01 `
+  --train-batch-size 2 `
   --gradient-accumulation-steps 16 `
   --dtype bf16 `
   --attn-implementation sdpa `
-  --save-steps 200
+  --save-steps 10
 ```
+
+# "q_proj,k_proj,v_proj,out_proj"　もあり。
 
 ## 3) adapterをベースにマージ（推論用）
 
@@ -82,10 +85,10 @@ if (!(Test-Path .\third_party\llama.cpp)) {
 
 ```powershell
 .\.venv\Scripts\python.exe .\third_party\llama.cpp\convert_lora_to_gguf.py `
-  "E:\Python\MioTTS-Inference\outputs\lora_test1_attn" `
+  "E:\Python\MioTTS-Inference\outputs\lora_test2_attn_rank32" `
   --base "E:\Python\MioTTS-Inference\models\MioTTS-2.6B" `
   --outtype bf16 `
-  --outfile "E:\Python\MioTTS-Inference\outputs\lora_test1_attn\adapter-lora-bf16.gguf"
+  --outfile "E:\Python\MioTTS-Inference\outputs\lora_test2_attn_rank32\adapter-lora-bf16.gguf"
 ```
 
 ### 4-2-2) llama-server起動時にLoRA適用
@@ -93,9 +96,8 @@ if (!(Test-Path .\third_party\llama.cpp)) {
 `--special` は MioTTS で必須。
 
 ```powershell
-"C:\Users\kenta\AppData\Local\Microsoft\WinGet\Packages\ggml.llamacpp_Microsoft.Winget.Source_8wekyb3d8bbwe\llama-server.exe" `
-  -m "E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf" `
-  --lora "E:\Python\MioTTS-Inference\outputs\lora_test1_attn\adapter-lora-bf16.gguf" `
+llama-server -m "E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf" `
+  --lora "E:\Python\MioTTS-Inference\outputs\lora_test1_attn_2\adapter-lora-bf16.gguf" `
   --special `
   --port 8000 `
   -c 8192 --cont-batching --batch_size 8
