@@ -2,7 +2,7 @@ llama-server -m E:\Python\MioTTS-Inference\models\MioTTS-2.6B-BF16.gguf -c 8192 
 
 llama-server `
   -m ".\models\MioTTS-2.6B-BF16.gguf" `
-  --lora-scaled ".\outputs\lora_test2_attn_rank32\adapter-lora-bf16_2.gguf:1.0" `
+  --lora-scaled ".\outputs\lora_test2_attn_rank32\adapter-lora-bf16.gguf:1.0" `
   --special `
   --port 8000 -c 8192 --cont-batching --batch_size 8
 

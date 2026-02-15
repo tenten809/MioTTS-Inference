@@ -30,14 +30,14 @@
 
 ```powershell
 .\.venv\Scripts\python.exe .\scripts\generate_preset_multi.py `
-  --audio-dir "E:\dataset\my_voice_wavs" `
+  --audio-dir ".\data\test2/raw" `
   --audio-glob "**/*" `
   --extensions ".wav,.flac,.ogg,.mp3,.m4a" `
-  --preset-id "my_voice_agg" `
+  --preset-id "test2" `
   --output-dir ".\presets" `
   --device "cuda" `
-  --segment-seconds 12 `
-  --segment-hop-seconds 12 `
+  --segment-seconds 15 `
+  --segment-hop-seconds 15 `
   --min-segment-seconds 3 `
   --keep-ratio 0.8 `
   --max-clusters 4 `
