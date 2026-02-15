@@ -42,6 +42,7 @@ class LLMClient:
         model: str,
         temperature: float,
         top_p: float,
+        top_k: int | None,
         max_tokens: int,
         repetition_penalty: float,
         presence_penalty: float,
@@ -58,6 +59,8 @@ class LLMClient:
             "presence_penalty": presence_penalty,
             "frequency_penalty": frequency_penalty,
         }
+        if top_k is not None and top_k > 0:
+            payload["top_k"] = top_k
         logger.debug("Sending chat request to %s", self._chat_url)
         return await self._post_with_retry(self._chat_url, payload)
 

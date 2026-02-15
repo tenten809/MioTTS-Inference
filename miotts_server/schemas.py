@@ -9,6 +9,7 @@ class LLMParams(BaseModel):
     model: str | None = Field(default=None, description="LLM model id")
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    top_k: int | None = Field(default=None, ge=1)
     max_tokens: int | None = Field(default=None, ge=1)
     repetition_penalty: float | None = Field(default=None, ge=1.0, le=1.5)
     presence_penalty: float | None = Field(default=None, ge=0.0, le=1.0)

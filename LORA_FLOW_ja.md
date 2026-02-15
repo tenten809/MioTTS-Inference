@@ -34,7 +34,7 @@ cd E:\Python\MioTTS-Inference
 .\.venv\Scripts\python.exe .\scripts\train_lora.py `
   --base-model "E:\Python\MioTTS-Inference\models\MioTTS-2.6B" `
   --train-jsonl "E:\Python\MioTTS-Inference\data\test2\train_lora.jsonl" `
-  --output-dir "E:\Python\MioTTS-Inference\outputs\lora_test2_attn_rank32" `
+  --output-dir "E:\Python\MioTTS-Inference\loras\test2" `
   --target-modules "self_attn.q_proj,self_attn.k_proj,self_attn.v_proj,self_attn.out_proj" `
   --lora-r 32 `
   --lora-alpha 64 `
@@ -47,7 +47,7 @@ cd E:\Python\MioTTS-Inference
   --gradient-accumulation-steps 16 `
   --dtype bf16 `
   --attn-implementation sdpa `
-  --save-steps 10
+  --save-steps 50
 ```
 
 # "q_proj,k_proj,v_proj,out_proj"　もあり。

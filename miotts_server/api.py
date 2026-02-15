@@ -33,6 +33,10 @@ from .text import normalize_text
 from .token_parser import parse_speech_tokens
 
 logger = logging.getLogger(__name__)
+SPEECH_TOKEN_SYSTEM_PROMPT = (
+    "You are a TTS token generator. "
+    "Output only speech tokens in the exact format <|s_123|> with no extra text."
+)
 
 
 @asynccontextmanager
@@ -104,6 +108,7 @@ async def tts_file(
     model: str | None = Form(None),
     temperature: float | None = Form(None),
     top_p: float | None = Form(None),
+    top_k: int | None = Form(None),
     max_tokens: int | None = Form(None),
     repetition_penalty: float | None = Form(None),
     presence_penalty: float | None = Form(None),
@@ -144,6 +149,7 @@ async def tts_file(
                 model=model,
                 temperature=temperature,
                 top_p=top_p,
+                top_k=top_k,
                 max_tokens=max_tokens,
                 repetition_penalty=repetition_penalty,
                 presence_penalty=presence_penalty,
@@ -188,6 +194,7 @@ async def _run_tts(
         llm_params.temperature if llm_params.temperature is not None else llm_defaults.temperature
     )
     top_p = llm_params.top_p if llm_params.top_p is not None else llm_defaults.top_p
+    top_k = llm_params.top_k if llm_params.top_k is not None else llm_defaults.top_k
     max_tokens = (
         llm_params.max_tokens if llm_params.max_tokens is not None else llm_defaults.max_tokens
     )
@@ -206,8 +213,7 @@ async def _run_tts(
         if llm_params.frequency_penalty is not None
         else llm_defaults.frequency_penalty
     )
-    messages: list[dict[str, Any]] = []
-    messages.append({"role": "user", "content": normalized})
+    messages: list[dict[str, Any]] = [{"role": "user", "content": normalized}]
 
     best_of_n = _resolve_best_of_n(request, config)
     asr_service: ASRService | None = app.state.asr_service
@@ -234,6 +240,7 @@ async def _run_tts(
             model=model,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             max_tokens=max_tokens,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
@@ -245,14 +252,39 @@ async def _run_tts(
         raise HTTPException(status_code=502, detail=f"LLM request failed: {exc}") from exc
     t1 = time.perf_counter()
 
-    tokens_list: list[list[int]] = []
-    for llm_text in llm_texts:
-        try:
-            tokens_list.append(parse_speech_tokens(llm_text))
-        except ValueError as exc:
-            logger.warning("Skipping candidate with invalid tokens: %s", exc)
+    tokens_list = _parse_llm_candidates(llm_texts)
     if not tokens_list:
-        raise HTTPException(status_code=422, detail="No speech tokens found in LLM output.")
+        logger.warning("No speech tokens found; retrying LLM with strict token prompt.")
+        strict_messages = [
+            {"role": "system", "content": SPEECH_TOKEN_SYSTEM_PROMPT},
+            {"role": "user", "content": normalized},
+        ]
+        try:
+            llm_texts_retry = await _fetch_llm_candidates(
+                llm_client=llm_client,
+                messages=strict_messages,
+                model=model,
+                temperature=min(float(temperature), 0.4),
+                top_p=min(float(top_p), 0.95),
+                top_k=top_k,
+                max_tokens=max_tokens,
+                repetition_penalty=repetition_penalty,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty,
+                n=best_of_n.n if best_of_n.enabled else 1,
+            )
+        except Exception as exc:
+            logger.exception("LLM strict retry failed")
+            raise HTTPException(status_code=502, detail=f"LLM strict retry failed: {exc}") from exc
+        tokens_list = _parse_llm_candidates(llm_texts_retry)
+    if not tokens_list:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "No speech tokens found in LLM output. "
+                "Try lower temperature/top_p, or verify llama-server model/settings."
+            ),
+        )
     logger.debug(
         "LLM candidates: count=%d token_lengths=%s", len(tokens_list), [len(t) for t in tokens_list]
     )
@@ -451,12 +483,23 @@ def _resolve_best_of_n(request: TTSRequest, config) -> _ResolvedBestOfN:
     )
 
 
+def _parse_llm_candidates(llm_texts: list[str]) -> list[list[int]]:
+    tokens_list: list[list[int]] = []
+    for llm_text in llm_texts:
+        try:
+            tokens_list.append(parse_speech_tokens(llm_text))
+        except ValueError as exc:
+            logger.warning("Skipping candidate with invalid tokens: %s", exc)
+    return tokens_list
+
+
 async def _fetch_llm_candidates(
     llm_client: LLMClient,
     messages: list[dict[str, Any]],
     model: str,
     temperature: float,
     top_p: float,
+    top_k: int | None,
     max_tokens: int,
     repetition_penalty: float,
     presence_penalty: float,
@@ -469,6 +512,7 @@ async def _fetch_llm_candidates(
             model=model,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             max_tokens=max_tokens,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
@@ -482,6 +526,7 @@ async def _fetch_llm_candidates(
             model=model,
             temperature=temperature,
             top_p=top_p,
+            top_k=top_k,
             max_tokens=max_tokens,
             repetition_penalty=repetition_penalty,
             presence_penalty=presence_penalty,
