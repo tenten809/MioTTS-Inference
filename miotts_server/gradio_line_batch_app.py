@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import csv
 import hashlib
 import io
 import json
@@ -8,6 +9,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from pathlib import Path
 from typing import Any
 
@@ -20,10 +22,12 @@ DEFAULT_TTS_API_BASE = os.getenv("MIOTTS_API_BASE", "http://localhost:8001")
 DEFAULT_LLM_API_BASE = os.getenv("MIOTTS_LLM_BASE", "http://localhost:8000")
 DEFAULT_PRESETS_DIR = Path(os.getenv("MIOTTS_PRESETS_DIR", "presets")).expanduser()
 DEFAULT_LORAS_DIR = Path(os.getenv("MIOTTS_LORAS_DIR", "loras")).expanduser()
+DEFAULT_TEXT_REPLACE_CSV = Path(os.getenv("MIOTTS_TEXT_REPLACE_CSV", "text_replace_dict.csv")).expanduser()
 NONE_LORA_VALUE = "__none__"
 PROCESS_LOCK = threading.Lock()
 UNKNOWN_LORA_STATE = {"id": "__unknown__", "scale": -1.0}
 _BRACKETS_TO_SPACE = str.maketrans({c: " " for c in "「」『』()（）[]［］{}｛｝〈〉《》【】〔〕〖〗"})
+_ASCII_TO_FULLWIDTH = str.maketrans({chr(i): chr(i + 0xFEE0) for i in range(33, 127)})
 _DAKUTEN_MARKS_RE = re.compile(r"[゛゜ﾞﾟ゙゚]")
 _EMOJI_RE = re.compile(
     "["
@@ -34,6 +38,16 @@ _EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 _EMOJI_JOINERS_RE = re.compile(r"[\u200d\ufe0f]")
+_CONTROL_CHARS_RE = re.compile(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]")
+_ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]")
+_RUBY_WITH_BASE_RE = re.compile(r"[｜|]([^｜|《》\n]+)《[^《》\n]+》")
+_RUBY_BRACKET_RE = re.compile(r"《[^《》\n]+》")
+_NOTE_MARK_RE = re.compile(r"※[^\n。！？!?]*")
+_DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
+_SYMBOL_REPEAT_RE = re.compile(r"([!！?？。．，、…〜～~・:：;；,．.])\1{3,}")
+_LONG_SOKUON_REPEAT_RE = re.compile(r"([ーっッ])\1{3,}")
+_TEXT_REPLACE_CACHE_KEY: tuple[Path, float] | None = None
+_TEXT_REPLACE_CACHE: list[tuple[str, str]] = []
 UI_CSS = """
 #tts-rows-table table {
   table-layout: fixed;
@@ -96,13 +110,87 @@ def _audio_from_b64(audio_b64: str) -> tuple[int, np.ndarray]:
     return _decode_wav_bytes(base64.b64decode(audio_b64))
 
 
+def _normalize_date_ymd(text: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        y = int(match.group(1))
+        m = int(match.group(2))
+        d = int(match.group(3))
+        if not (1 <= m <= 12 and 1 <= d <= 31):
+            return match.group(0)
+        return f"{y}年{m}月{d}日"
+
+    return _DATE_YMD_RE.sub(_replace, text)
+
+
+def _load_text_replace_dict(csv_path: Path | str) -> list[tuple[str, str]]:
+    global _TEXT_REPLACE_CACHE_KEY, _TEXT_REPLACE_CACHE
+    path = Path(csv_path).expanduser()
+    try:
+        resolved = path.resolve()
+    except Exception:
+        return []
+    if not resolved.exists() or not resolved.is_file():
+        return []
+    try:
+        mtime = resolved.stat().st_mtime
+    except Exception:
+        return []
+    cache_key = (resolved, mtime)
+    if _TEXT_REPLACE_CACHE_KEY == cache_key:
+        return _TEXT_REPLACE_CACHE
+
+    rows: list[tuple[str, str]] = []
+    try:
+        with resolved.open("r", encoding="utf-8-sig", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if len(row) < 2:
+                    continue
+                src = row[0].strip()
+                dst = row[1].strip()
+                if not src or src.startswith("#"):
+                    continue
+                if src.lower() in {"word", "source"} and dst.lower() in {"reading", "kana", "yomi", "target"}:
+                    continue
+                rows.append((src, dst))
+    except Exception:
+        return []
+
+    unique: dict[str, str] = {}
+    for src, dst in rows:
+        if src not in unique:
+            unique[src] = dst
+    items = sorted(unique.items(), key=lambda x: len(x[0]), reverse=True)
+    _TEXT_REPLACE_CACHE_KEY = cache_key
+    _TEXT_REPLACE_CACHE = items
+    return items
+
+
+def _apply_text_replace_dict(text: str) -> str:
+    for src, dst in _load_text_replace_dict(DEFAULT_TEXT_REPLACE_CSV):
+        text = text.replace(src, dst)
+    return text
+
+
 def _normalize_text_for_tts(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text)
+    text = _CONTROL_CHARS_RE.sub("", text)
+    text = _ZERO_WIDTH_RE.sub("", text)
+    text = _RUBY_WITH_BASE_RE.sub(r"\1", text)
+    text = _RUBY_BRACKET_RE.sub("", text)
+    text = _NOTE_MARK_RE.sub("", text)
     text = _DAKUTEN_MARKS_RE.sub("", text)
     text = text.translate(_BRACKETS_TO_SPACE)
     text = _EMOJI_RE.sub("", text)
     text = _EMOJI_JOINERS_RE.sub("", text)
+    text = _normalize_date_ymd(text)
+    text = _SYMBOL_REPEAT_RE.sub(lambda m: m.group(1) * 3, text)
+    text = _LONG_SOKUON_REPEAT_RE.sub(lambda m: m.group(1) * 3, text)
+    text = _apply_text_replace_dict(text)
     text = re.sub(r"[ \t\u3000]+", " ", text)
+    text = re.sub(r" +([。．！？!?、，])", r"\1", text)
     text = re.sub(r" *\n *", "\n", text)
+    text = text.translate(_ASCII_TO_FULLWIDTH)
     return text.strip()
 
 
@@ -110,7 +198,7 @@ def _split_text_to_lines(text: str) -> list[str]:
     text = _normalize_text_for_tts(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines: list[str] = []
-    pattern = re.compile(r".+?(?:[。！？!?]+|$)")
+    pattern = re.compile(r".+?(?:[。．！？!?]+|$)")
 
     def _split_by_sentence(chunk: str) -> list[str]:
         out: list[str] = []
