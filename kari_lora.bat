@@ -5,7 +5,7 @@ cd /d "%~dp0"
 
 set "PYTHON_EXE=.venv\Scripts\python.exe"
 set "DATA_ROOT=%CD%\data"
-set "CODEC_MODEL_ID=Aratako/MioCodec-25Hz-24kHz"
+set "CODEC_MODEL_ID=Aratako/MioCodec-25Hz-44.1kHz-v2"
 set "DEVICE=cuda"
 set "MAX_AUDIO_SEC=30"
 set "PRINT_EVERY=20"

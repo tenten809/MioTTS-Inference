@@ -42,7 +42,6 @@ class ServerConfig:
     llm_model: str | None
     llm_timeout: float
     codec_model_id: str
-    codec_adapter_path: str | None
     device: str
     max_text_length: int
     presets_dir: Path
@@ -63,7 +62,6 @@ class ServerConfig:
 class DefaultLLMParams:
     temperature: float
     top_p: float
-    top_k: int | None
     max_tokens: int
     repetition_penalty: float
     presence_penalty: float
@@ -101,7 +99,6 @@ def get_config() -> ServerConfig:
             llm_model=os.getenv("MIOTTS_LLM_MODEL"),
             llm_timeout=_env_float("MIOTTS_LLM_TIMEOUT", 120.0),
             codec_model_id=os.getenv("MIOTTS_CODEC_MODEL", "Aratako/MioCodec-25Hz-44.1kHz-v2"),
-            codec_adapter_path=os.getenv("MIOTTS_CODEC_ADAPTER"),
             device=device,
             max_text_length=_env_int("MIOTTS_MAX_TEXT_LENGTH", 300),
             presets_dir=presets_dir,
@@ -126,7 +123,6 @@ def get_llm_defaults() -> DefaultLLMParams:
         _llm_defaults = DefaultLLMParams(
             temperature=_env_float("MIOTTS_LLM_TEMPERATURE", 0.8),
             top_p=_env_float("MIOTTS_LLM_TOP_P", 1.0),
-            top_k=None if _env_int("MIOTTS_LLM_TOP_K", 0) <= 0 else _env_int("MIOTTS_LLM_TOP_K", 0),
             max_tokens=_env_int("MIOTTS_LLM_MAX_TOKENS", 700),
             repetition_penalty=_env_float("MIOTTS_LLM_REPETITION_PENALTY", 1.0),
             presence_penalty=_env_float("MIOTTS_LLM_PRESENCE_PENALTY", 0.0),

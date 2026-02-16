@@ -23,6 +23,17 @@ DEFAULT_LORAS_DIR = Path(os.getenv("MIOTTS_LORAS_DIR", "loras")).expanduser()
 NONE_LORA_VALUE = "__none__"
 PROCESS_LOCK = threading.Lock()
 UNKNOWN_LORA_STATE = {"id": "__unknown__", "scale": -1.0}
+_BRACKETS_TO_SPACE = str.maketrans({c: " " for c in "「」『』()（）[]［］{}｛｝〈〉《》【】〔〕〖〗"})
+_DAKUTEN_MARKS_RE = re.compile(r"[゛゜ﾞﾟ゙゚]")
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F1E6-\U0001F1FF"  # flags
+    "\U0001F300-\U0001FAFF"  # symbols and pictographs
+    "\U00002700-\U000027BF"  # dingbats
+    "]",
+    flags=re.UNICODE,
+)
+_EMOJI_JOINERS_RE = re.compile(r"[\u200d\ufe0f]")
 UI_CSS = """
 #tts-rows-table table {
   table-layout: fixed;
@@ -85,7 +96,18 @@ def _audio_from_b64(audio_b64: str) -> tuple[int, np.ndarray]:
     return _decode_wav_bytes(base64.b64decode(audio_b64))
 
 
+def _normalize_text_for_tts(text: str) -> str:
+    text = _DAKUTEN_MARKS_RE.sub("", text)
+    text = text.translate(_BRACKETS_TO_SPACE)
+    text = _EMOJI_RE.sub("", text)
+    text = _EMOJI_JOINERS_RE.sub("", text)
+    text = re.sub(r"[ \t\u3000]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
+
+
 def _split_text_to_lines(text: str) -> list[str]:
+    text = _normalize_text_for_tts(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines: list[str] = []
     pattern = re.compile(r".+?(?:[。！？!?]+|$)")
@@ -147,9 +169,12 @@ def _fetch_presets_from_dir(presets_dir: Path | str) -> list[str]:
     if not base.exists():
         return []
     presets: list[str] = []
-    for path in base.iterdir():
-        if path.is_file() and path.suffix.lower() in {".pt", ".npz"}:
-            presets.append(path.stem)
+    for path in base.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in {".pt", ".npz"}:
+            continue
+        presets.append(path.stem)
     return sorted(set(presets))
 
 

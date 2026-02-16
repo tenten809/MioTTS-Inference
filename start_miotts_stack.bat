@@ -22,7 +22,7 @@ rem Base GGUF model for llama-server (relative to repo root)
 set "BASE_GGUF=models\MioTTS-2.6B-BF16.gguf"
 
 rem Runtime LoRA GGUF adapter (relative path recommended; blank to disable)
-set "LORA_ADAPTER=outputs\lora_test2_attn_rank32\adapter-lora-bf16.gguf"
+set "LORA_ADAPTER=\loras\60s_documentary_v2\adapter-lora-bf16.gguf"
 set "LORA_SCALE=0.80"
 set "LORAS_DIR=loras"
 set "LOAD_ALL_LORAS=1"
@@ -39,7 +39,7 @@ set "LLM_BATCH=8"
 
 rem MioTTS settings
 set "ENABLE_BEST_OF_N=true"
-set "CODEC_MODEL=Aratako/MioCodec-25Hz-24kHz"
+set "CODEC_MODEL=Aratako/MioCodec-25Hz-44.1kHz-v2"
 rem Optional: codec adapter safetensors path (relative to repo). Leave blank to disable.
 set "CODEC_ADAPTER="
 
@@ -102,10 +102,10 @@ if not defined LLAMA_SERVER_EXE (
   goto :error_exit
 )
 
-if defined LORA_ADAPTER if not "%LOAD_ALL_LORAS%"=="1" (
+if defined LORA_ADAPTER (
   if not exist "%LORA_ADAPTER%" (
     echo [WARN] LoRA adapter not found: %LORA_ADAPTER%
-    echo [WARN] Continue without LoRA.
+    echo [WARN] Continue without single LoRA adapter.
     set "LORA_ADAPTER="
   )
 )
@@ -132,11 +132,16 @@ if "%LOAD_ALL_LORAS%"=="1" (
   )
 )
 
+if "%LOAD_ALL_LORAS%"=="1" if not defined ALL_LORAS if not defined LORA_ADAPTER (
+  echo [WARN] No LoRA files found under %LORAS_DIR%. Continue without LoRA.
+)
+
 rem ----------------------------
 rem Shared env for child processes
 rem ----------------------------
 set "MIOTTS_BEST_OF_N_ENABLED=%ENABLE_BEST_OF_N%"
 set "MIOTTS_CODEC_MODEL=%CODEC_MODEL%"
+set "MIOTTS_LORAS_DIR=%LORAS_DIR%"
 if defined CODEC_ADAPTER (
   if exist "%CODEC_ADAPTER%" (
     set "MIOTTS_CODEC_ADAPTER=%CODEC_ADAPTER%"
@@ -172,7 +177,7 @@ if defined PORT_PID (
   echo [INFO] llama-server port %LLM_PORT% already in use pid=%PORT_PID%. Skip start.
 ) else (
   if defined ALL_LORAS (
-    start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --lora "%ALL_LORAS%" --lora-init-without-apply --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch_size %LLM_BATCH%
+    start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --lora "%ALL_LORAS%" --lora-init-without-apply --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch-size %LLM_BATCH%
   ) else if defined LORA_ADAPTER (
     set "USE_LORA_SCALED=1"
     if not "!LORA_ADAPTER::=!"=="!LORA_ADAPTER!" (
@@ -181,12 +186,12 @@ if defined PORT_PID (
       set "USE_LORA_SCALED="
     )
     if defined USE_LORA_SCALED (
-      start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --lora-scaled "%LORA_ADAPTER%:%LORA_SCALE%" --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch_size %LLM_BATCH%
+      start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --lora-scaled "%LORA_ADAPTER%:%LORA_SCALE%" --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch-size %LLM_BATCH%
     ) else (
-      start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --lora "%LORA_ADAPTER%" --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch_size %LLM_BATCH%
+      start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --lora "%LORA_ADAPTER%" --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch-size %LLM_BATCH%
     )
   ) else (
-    start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch_size %LLM_BATCH%
+    start "llama-server" /d "%CD%" "%LLAMA_SERVER_EXE%" -m "%BASE_GGUF%" --special --port %LLM_PORT% -c %LLM_CTX% --cont-batching --batch-size %LLM_BATCH%
   )
 )
 

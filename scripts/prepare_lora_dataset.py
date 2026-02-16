@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-jsonl", required=True, help="Output JSONL path")
     parser.add_argument(
         "--codec-model-id",
-        default="Aratako/MioCodec-25Hz-24kHz",
+        default="Aratako/MioCodec-25Hz-44.1kHz-v2",
         help="MioCodec model id",
     )
     parser.add_argument("--device", default="cuda", help="cuda/cpu")

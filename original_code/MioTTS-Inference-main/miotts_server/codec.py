@@ -22,12 +22,10 @@ class MioCodecService:
     def __init__(
         self,
         model_id: str,
-        adapter_path: str | None,
         device: str,
         presets_dir: Path,
     ) -> None:
         self._model_id = model_id
-        self._adapter_path = adapter_path
         self._device = device
         self._presets_dir = presets_dir
         self._codec: MioCodecModel | None = None
@@ -36,7 +34,6 @@ class MioCodecService:
     def load(self) -> None:
         logger.info("Loading MioCodec model: %s", self._model_id)
         codec = MioCodecModel.from_pretrained(self._model_id)
-        self._apply_adapter(codec)
         codec = codec.eval().to(self._device)
         self._codec = codec
 
@@ -54,12 +51,9 @@ class MioCodecService:
         if not self._presets_dir.exists():
             return []
         presets = []
-        for path in self._presets_dir.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.suffix.lower() not in {".pt", ".npz"}:
-                continue
-            presets.append(path.stem)
+        for path in self._presets_dir.iterdir():
+            if path.suffix.lower() in {".pt", ".npz"}:
+                presets.append(path.stem)
         return sorted(set(presets))
 
     def load_preset_embedding(self, preset_id: str) -> torch.Tensor:
@@ -80,19 +74,20 @@ class MioCodecService:
     ) -> torch.Tensor:
         if reference_waveform is None and global_embedding is None:
             raise ValueError("Either reference_waveform or global_embedding is required.")
-
         device = _codec_device(self.codec)
 
         # Extract global embedding from reference waveform if provided
         if reference_waveform is not None:
-            reference_waveform = _prepare_reference_waveform(reference_waveform, device)
+            reference_waveform = reference_waveform.to(device=device, dtype=torch.float32)
             ref_features = self.codec.encode(reference_waveform, return_content=False, return_global=True)
             global_embedding = ref_features.global_embedding
 
         if isinstance(tokens, list):
             tokens = torch.tensor(tokens, dtype=torch.long, device=device)
-        elif isinstance(tokens, torch.Tensor):
+        elif isinstance(tokens, torch.Tensor) and tokens.dtype != torch.long:
             tokens = tokens.long().to(device)
+        elif isinstance(tokens, torch.Tensor):
+            tokens = tokens.to(device)
         return self.codec.decode(
             global_embedding=global_embedding,
             content_token_indices=tokens,
@@ -115,7 +110,7 @@ class MioCodecService:
 
         # Extract global embedding from reference waveform if provided
         if reference_waveform is not None:
-            reference_waveform = _prepare_reference_waveform(reference_waveform, device)
+            reference_waveform = reference_waveform.to(device=device, dtype=torch.float32)
             ref_features = self.codec.encode(reference_waveform, return_content=False, return_global=True)
             global_embedding = ref_features.global_embedding
         token_tensors = []
@@ -161,69 +156,17 @@ class MioCodecService:
     def _resolve_preset(self, preset_id: str) -> PresetEntry:
         preset_id = _sanitize_preset_id(preset_id)
         base_dir = self._presets_dir.resolve()
-        if "/" in preset_id:
-            rel_path = Path(*preset_id.split("/"))
-            candidates = [
-                (base_dir / rel_path).with_suffix(".pt").resolve(),
-                (base_dir / rel_path).with_suffix(".npz").resolve(),
-            ]
-            for path in candidates:
-                if not _is_path_within(path, base_dir):
-                    logger.warning("Rejected preset path outside presets dir: %s", path)
-                    continue
-                if path.exists():
-                    return PresetEntry(preset_id=preset_id, path=path)
-            raise FileNotFoundError(f"Preset '{preset_id}' not found in {base_dir}.")
-
-        matches: list[Path] = []
-        for path in base_dir.rglob("*"):
-            if not path.is_file():
+        candidates = [
+            (base_dir / f"{preset_id}.pt").resolve(),
+            (base_dir / f"{preset_id}.npz").resolve(),
+        ]
+        for path in candidates:
+            if not _is_path_within(path, base_dir):
+                logger.warning("Rejected preset path outside presets dir: %s", path)
                 continue
-            if path.suffix.lower() not in {".pt", ".npz"}:
-                continue
-            if path.stem != preset_id:
-                continue
-            resolved = path.resolve()
-            if not _is_path_within(resolved, base_dir):
-                logger.warning("Rejected preset path outside presets dir: %s", resolved)
-                continue
-            matches.append(resolved)
-
-        if not matches:
-            raise FileNotFoundError(f"Preset '{preset_id}' not found in {base_dir}.")
-        if len(matches) > 1:
-            rels = ", ".join(str(p.relative_to(base_dir)) for p in sorted(matches)[:5])
-            raise ValueError(
-                f"Preset '{preset_id}' is duplicated under {base_dir}. "
-                f"Use unique names (examples: {rels})."
-            )
-        return PresetEntry(preset_id=preset_id, path=matches[0])
-
-    def _apply_adapter(self, codec: MioCodecModel) -> None:
-        if not self._adapter_path:
-            return
-        adapter = Path(self._adapter_path).expanduser().resolve()
-        if not adapter.exists():
-            raise FileNotFoundError(f"MioCodec adapter not found: {adapter}")
-
-        logger.info("Loading MioCodec adapter: %s", adapter)
-        if adapter.suffix.lower() == ".safetensors":
-            from safetensors.torch import load_file
-
-            state_dict = load_file(str(adapter), device="cpu")
-        else:
-            state_dict = torch.load(adapter, map_location="cpu", weights_only=True)
-
-        result = codec.load_state_dict(state_dict, strict=False)
-        missing = list(getattr(result, "missing_keys", []))
-        unexpected = list(getattr(result, "unexpected_keys", []))
-        logger.info(
-            "MioCodec adapter loaded (missing=%d, unexpected=%d)",
-            len(missing),
-            len(unexpected),
-        )
-        if unexpected:
-            logger.warning("Unexpected adapter keys: %s", unexpected[:10])
+            if path.exists():
+                return PresetEntry(preset_id=preset_id, path=path)
+        raise FileNotFoundError(f"Preset '{preset_id}' not found in {base_dir}.")
 
 
 def _load_embedding_from_path(path: Path) -> Any:
@@ -257,39 +200,19 @@ def _prepare_embedding(embedding: Any, device: torch.device | str) -> torch.Tens
     return embedding.to(device)
 
 
-def _prepare_reference_waveform(
-    waveform: Any, device: torch.device | str
-) -> torch.Tensor:
-    if isinstance(waveform, np.ndarray):
-        waveform = torch.from_numpy(waveform)
-    if not isinstance(waveform, torch.Tensor):
-        waveform = torch.tensor(waveform)
-    waveform = waveform.squeeze()
-    if waveform.dim() != 1:
-        waveform = waveform.flatten()
-    return waveform.to(device=device, dtype=torch.float32)
-
-
 def _codec_device(codec: MioCodecModel) -> torch.device:
     return next(codec.parameters()).device
 
 
 def _sanitize_preset_id(preset_id: str) -> str:
-    normalized = preset_id.strip().replace("\\", "/")
+    normalized = preset_id.strip()
     if not normalized:
         raise ValueError("Invalid preset_id: empty value.")
-    if "\x00" in normalized:
+    if normalized in {".", ".."}:
         raise ValueError("Invalid preset_id.")
-    if ":" in normalized:
+    if any(sep in normalized for sep in ("/", "\\", "\x00")):
         raise ValueError("Invalid preset_id.")
-    if normalized.startswith("/"):
-        raise ValueError("Invalid preset_id.")
-    parts = [part for part in normalized.split("/") if part]
-    if not parts:
-        raise ValueError("Invalid preset_id.")
-    if any(part in {".", ".."} for part in parts):
-        raise ValueError("Invalid preset_id.")
-    return "/".join(parts)
+    return normalized
 
 
 def _is_path_within(path: Path, base_dir: Path) -> bool:

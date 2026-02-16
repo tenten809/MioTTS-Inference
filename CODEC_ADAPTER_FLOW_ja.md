@@ -12,7 +12,7 @@ cd E:\Python\MioTTS-Inference
 .\.venv\Scripts\python.exe .\scripts\train_codec_adapter.py `
   --esd-list "E:\Python\MioTTS-Inference\data\test1\esd.list" `
   --audio-root "E:\Python\MioTTS-Inference\data\test1\raw" `
-  --codec-model-id "Aratako/MioCodec-25Hz-24kHz" `
+  --codec-model-id "Aratako/MioCodec-25Hz-44.1kHz-v2" `
   --output-adapter "E:\Python\MioTTS-Inference\outputs\codec_adapter_test1.safetensors" `
   --device cuda `
   --epochs 8 `
@@ -35,7 +35,7 @@ cd E:\Python\MioTTS-Inference
 PowerShell で環境変数を設定して API サーバを起動:
 
 ```powershell
-$env:MIOTTS_CODEC_MODEL = "Aratako/MioCodec-25Hz-24kHz"
+$env:MIOTTS_CODEC_MODEL = "Aratako/MioCodec-25Hz-44.1kHz-v2"
 $env:MIOTTS_CODEC_ADAPTER = "E:\Python\MioTTS-Inference\outputs\codec_adapter_test1.safetensors"
 
 .\.venv\Scripts\python.exe .\run_server.py --llm-base-url http://localhost:8000/v1 --best-of-n-enabled

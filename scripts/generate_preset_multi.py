@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default="presets", help="Output directory.")
     parser.add_argument(
-        "--model-id", default="Aratako/MioCodec-25Hz-24kHz", help="MioCodec model id."
+        "--model-id", default="Aratako/MioCodec-25Hz-44.1kHz-v2", help="MioCodec model id."
     )
     parser.add_argument("--device", default="cuda", help="Device to use (cuda/cpu).")
     parser.add_argument(

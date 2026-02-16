@@ -20,7 +20,7 @@ cd E:\Python\MioTTS-Inference
   --esd-list "E:\Python\MioTTS-Inference\data\test1\esd.list" `
   --audio-root "E:\Python\MioTTS-Inference\data\test1\raw" `
   --output-jsonl "E:\Python\MioTTS-Inference\data\test1\train_lora.jsonl" `
-  --codec-model-id "Aratako/MioCodec-25Hz-24kHz" `
+  --codec-model-id "Aratako/MioCodec-25Hz-44.1kHz-v2" `
   --device "cuda" `
   --max-audio-sec 30 `
   --print-every 20

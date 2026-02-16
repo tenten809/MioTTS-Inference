@@ -31,7 +31,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--codec-model-id",
-        default="Aratako/MioCodec-25Hz-24kHz",
+        default="Aratako/MioCodec-25Hz-44.1kHz-v2",
         help="Base MioCodec model id",
     )
     parser.add_argument("--output-adapter", required=True, help="Output adapter safetensors path")
