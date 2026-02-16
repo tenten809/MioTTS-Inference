@@ -13,7 +13,7 @@ set "LORA_R=32"
 set "LORA_ALPHA=64"
 set "LORA_DROPOUT=0.1"
 set "MAX_LENGTH=2048"
-set "EPOCHS=10"
+set "EPOCHS=20"
 set "LEARNING_RATE=1e-4"
 set "WEIGHT_DECAY=0.01"
 set "TRAIN_BATCH_SIZE=2"
@@ -83,7 +83,7 @@ for /d %%D in ("%DATA_ROOT%\*") do (
       echo [FAIL] !NAME!
       set /a FAIL_COUNT+=1
     ) else (
-      echo [ OK ] !NAME! -> !OUT_DIR!
+      echo [ OK ] !NAME! output !OUT_DIR!
     )
     set /a RUN_COUNT+=1
     echo.
@@ -92,4 +92,3 @@ for /d %%D in ("%DATA_ROOT%\*") do (
 
 echo [DONE] run=%RUN_COUNT% skip=%SKIP_COUNT% fail=%FAIL_COUNT%
 exit /b 0
-

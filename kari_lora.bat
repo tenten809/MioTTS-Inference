@@ -53,7 +53,7 @@ for /d %%D in ("%DATA_ROOT%\*") do (
     if errorlevel 1 (
       echo [FAIL] !NAME!
     ) else (
-      echo [ OK ] !NAME! -> !OUT_JSONL!
+      echo [ OK ] !NAME! output !OUT_JSONL!
     )
     set /a RUN_COUNT+=1
     echo.
