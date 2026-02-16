@@ -26,9 +26,9 @@ DEFAULT_TEXT_REPLACE_CSV = Path(os.getenv("MIOTTS_TEXT_REPLACE_CSV", "text_repla
 NONE_LORA_VALUE = "__none__"
 PROCESS_LOCK = threading.Lock()
 UNKNOWN_LORA_STATE = {"id": "__unknown__", "scale": -1.0}
-_BRACKETS_TO_SPACE = str.maketrans({c: " " for c in "「」『』()（）[]［］{}｛｝〈〉《》【】〔〕〖〗"})
 _ASCII_TO_FULLWIDTH = str.maketrans({chr(i): chr(i + 0xFEE0) for i in range(33, 127)})
 _DAKUTEN_MARKS_RE = re.compile(r"[゛゜ﾞﾟ゙゚]")
+_DAKUTEN_WITH_SPACE_RE = re.compile(r"[ \t\u3000]*[゛゜ﾞﾟ゙゚]")
 _EMOJI_RE = re.compile(
     "["
     "\U0001F1E6-\U0001F1FF"  # flags
@@ -38,6 +38,7 @@ _EMOJI_RE = re.compile(
     flags=re.UNICODE,
 )
 _EMOJI_JOINERS_RE = re.compile(r"[\u200d\ufe0f]")
+_CARD_SUIT_RE = re.compile(r"[♠♥♦♣♤♡♢♧]")
 _CONTROL_CHARS_RE = re.compile(r"[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]")
 _ZERO_WIDTH_RE = re.compile(r"[\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]")
 _RUBY_WITH_BASE_RE = re.compile(r"[｜|]([^｜|《》\n]+)《[^《》\n]+》")
@@ -46,6 +47,15 @@ _NOTE_MARK_RE = re.compile(r"※[^\n。！？!?]*")
 _DATE_YMD_RE = re.compile(r"(?<!\d)(\d{4})[./-](\d{1,2})[./-](\d{1,2})(?!\d)")
 _SYMBOL_REPEAT_RE = re.compile(r"([!！?？。．，、…〜～~・:：;；,．.])\1{3,}")
 _LONG_SOKUON_REPEAT_RE = re.compile(r"([ーっッ])\1{3,}")
+_ELLIPSIS_REPEAT_RE = re.compile(r"…{2,}")
+_ELLIPSIS_SENTINEL = "\uE000"
+_OPEN_BRACKETS = {"「": "」", "『": "』", "(": ")", "（": "）", "[": "]", "［": "］", "{": "}", "｛": "｝", "〈": "〉", "《": "》", "【": "】", "〔": "〕", "〖": "〗"}
+_SENTENCE_ENDINGS = {"。", "．", "！", "？", "!", "?"}
+_BRACKET_SPLIT_DELIMS = _SENTENCE_ENDINGS | {"、", "，", ",", "：", ":", "；", ";"}
+_BRACKET_MAX_CHARS = 50
+MIN_SPEECH_RATE = 0.5
+MAX_SPEECH_RATE = 2.0
+DEFAULT_SPEECH_RATE = 1.0
 _TEXT_REPLACE_CACHE_KEY: tuple[Path, float] | None = None
 _TEXT_REPLACE_CACHE: list[tuple[str, str]] = []
 UI_CSS = """
@@ -173,19 +183,24 @@ def _apply_text_replace_dict(text: str) -> str:
 
 
 def _normalize_text_for_tts(text: str) -> str:
+    # Keep U+2026 as-is across NFKC (NFKC may expand it to three periods).
+    text = text.replace("…", _ELLIPSIS_SENTINEL)
     text = unicodedata.normalize("NFKC", text)
+    text = text.replace(_ELLIPSIS_SENTINEL, "…")
     text = _CONTROL_CHARS_RE.sub("", text)
     text = _ZERO_WIDTH_RE.sub("", text)
     text = _RUBY_WITH_BASE_RE.sub(r"\1", text)
     text = _RUBY_BRACKET_RE.sub("", text)
     text = _NOTE_MARK_RE.sub("", text)
+    text = _DAKUTEN_WITH_SPACE_RE.sub("", text)
     text = _DAKUTEN_MARKS_RE.sub("", text)
-    text = text.translate(_BRACKETS_TO_SPACE)
     text = _EMOJI_RE.sub("", text)
     text = _EMOJI_JOINERS_RE.sub("", text)
+    text = _CARD_SUIT_RE.sub("", text)
     text = _normalize_date_ymd(text)
     text = _SYMBOL_REPEAT_RE.sub(lambda m: m.group(1) * 3, text)
     text = _LONG_SOKUON_REPEAT_RE.sub(lambda m: m.group(1) * 3, text)
+    text = _ELLIPSIS_REPEAT_RE.sub("…", text)
     text = _apply_text_replace_dict(text)
     text = re.sub(r"[ \t\u3000]+", " ", text)
     text = re.sub(r" +([。．！？!?、，])", r"\1", text)
@@ -198,51 +213,96 @@ def _split_text_to_lines(text: str) -> list[str]:
     text = _normalize_text_for_tts(text)
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines: list[str] = []
-    pattern = re.compile(r".+?(?:[。．！？!?]+|$)")
 
-    def _split_by_sentence(chunk: str) -> list[str]:
+    def _split_plain_text(chunk: str) -> list[str]:
         out: list[str] = []
-        chunk = chunk.strip()
-        if not chunk:
-            return out
-        for part in pattern.findall(chunk):
-            sentence = part.strip()
-            if sentence:
-                out.append(sentence)
+        buff: list[str] = []
+        for ch in chunk:
+            buff.append(ch)
+            if ch in _SENTENCE_ENDINGS:
+                sentence = "".join(buff).strip()
+                if sentence:
+                    out.append(sentence)
+                buff = []
+        tail = "".join(buff).strip()
+        if tail:
+            out.append(tail)
         return out
 
-    def _split_block_with_quotes(block: str) -> list[str]:
+    def _split_long_bracketed_chunk(chunk: str) -> list[str]:
+        chunk = chunk.strip()
+        if len(chunk) <= _BRACKET_MAX_CHARS:
+            return [chunk] if chunk else []
+
+        out: list[str] = []
+        start = 0
+        n = len(chunk)
+        while n - start > _BRACKET_MAX_CHARS:
+            split_idx = -1
+            i = start + _BRACKET_MAX_CHARS
+            while i < n:
+                if chunk[i] in _BRACKET_SPLIT_DELIMS:
+                    split_idx = i
+                    break
+                i += 1
+            if split_idx < 0:
+                break
+            part = chunk[start : split_idx + 1].strip()
+            if part:
+                out.append(part)
+            start = split_idx + 1
+
+        tail = chunk[start:].strip()
+        if tail:
+            out.append(tail)
+        return out
+
+    def _split_block_preserving_brackets(block: str) -> list[str]:
         out: list[str] = []
         i = 0
         n = len(block)
+        plain_start = 0
+
         while i < n:
-            q_start = block.find("「", i)
-            if q_start < 0:
-                out.extend(_split_by_sentence(block[i:]))
-                break
-            out.extend(_split_by_sentence(block[i:q_start]))
-            q_end = block.find("」", q_start + 1)
-            if q_end < 0:
-                out.extend(_split_by_sentence(block[q_start:]))
-                break
-            quoted = block[q_start : q_end + 1].strip()
-            if quoted:
-                if len(quoted) <= 50:
-                    out.append(quoted)
-                else:
-                    q_parts = _split_by_sentence(quoted)
-                    if len(q_parts) >= 2 and q_parts[-1] == "」":
-                        q_parts[-2] = q_parts[-2] + "」"
-                        q_parts.pop()
-                    out.extend(q_parts)
-            i = q_end + 1
+            ch = block[i]
+            if ch not in _OPEN_BRACKETS:
+                i += 1
+                continue
+
+            # Emit plain-text part before bracket.
+            if plain_start < i:
+                out.extend(_split_plain_text(block[plain_start:i]))
+
+            # Find matching closing bracket with nesting.
+            stack: list[str] = [_OPEN_BRACKETS[ch]]
+            j = i + 1
+            while j < n and stack:
+                cj = block[j]
+                if cj in _OPEN_BRACKETS:
+                    stack.append(_OPEN_BRACKETS[cj])
+                elif cj == stack[-1]:
+                    stack.pop()
+                j += 1
+
+            if stack:
+                # Unclosed bracket: treat the rest as plain text.
+                out.extend(_split_plain_text(block[i:]))
+                return out
+
+            chunk = block[i:j]
+            out.extend(_split_long_bracketed_chunk(chunk))
+            i = j
+            plain_start = i
+
+        if plain_start < n:
+            out.extend(_split_plain_text(block[plain_start:]))
         return out
 
     for block in text.split("\n"):
         block = block.strip()
         if not block:
             continue
-        for part in _split_block_with_quotes(block):
+        for part in _split_block_preserving_brackets(block):
             sentence = part.strip()
             if sentence:
                 lines.append(sentence)
@@ -364,6 +424,16 @@ def _parse_lora_key_from_table_cell(value: Any) -> str | None:
     return text or None
 
 
+def _normalize_speech_rate(value: Any, default: float = DEFAULT_SPEECH_RATE) -> float:
+    try:
+        rate = float(value)
+    except Exception:
+        return float(default)
+    if not np.isfinite(rate):
+        return float(default)
+    return float(min(MAX_SPEECH_RATE, max(MIN_SPEECH_RATE, rate)))
+
+
 def _lora_value_from_key(lora_key: str | None) -> str:
     if not lora_key:
         return NONE_LORA_VALUE
@@ -406,6 +476,7 @@ def _rows_table(rows: list[dict[str, Any]], adapters: list[dict[str, Any]]) -> l
                 row["text"],
                 _lora_label(row.get("lora_key"), adapters),
                 row.get("preset_id") or "",
+                _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
                 row.get("status", "pending"),
                 "yes" if row.get("audio_b64") else "no",
             ]
@@ -449,6 +520,7 @@ def _row_cache_key(
         "text": row["text"],
         "preset_id": row.get("preset_id"),
         "lora_key": row.get("lora_key"),
+        "speech_rate": _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
         "lora_scale": round(float(lora_scale), 4),
         "global_sig": global_sig,
     }
@@ -513,6 +585,7 @@ def _call_tts(
         "reference": {"type": "preset", "preset_id": preset_id},
         "llm": llm_payload,
         "output": {"format": "base64"},
+        "speech_rate": _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
     }
     if best_of_n_enabled:
         payload["best_of_n"] = {
@@ -582,6 +655,7 @@ def _refresh_refs(llm_base: str):
 def _split_into_rows(
     long_text: str,
     default_preset: str | None,
+    default_speech_rate: float,
     default_lora_value: str,
     adapters: list[dict[str, Any]],
 ):
@@ -595,6 +669,7 @@ def _split_into_rows(
                 "text": line,
                 "lora_key": default_lora_key,
                 "preset_id": default_preset,
+                "speech_rate": _normalize_speech_rate(default_speech_rate, DEFAULT_SPEECH_RATE),
                 "status": "pending",
                 "audio_b64": None,
                 "cache_key": None,
@@ -635,8 +710,11 @@ def _load_row_settings(
     presets: list[str],
 ):
     if not rows:
-        return "", gr.update(choices=_lora_choices(adapters), value=NONE_LORA_VALUE), gr.update(
-            choices=presets, value=(presets[0] if presets else None)
+        return (
+            "",
+            gr.update(choices=_lora_choices(adapters), value=NONE_LORA_VALUE),
+            gr.update(choices=presets, value=(presets[0] if presets else None)),
+            DEFAULT_SPEECH_RATE,
         )
     idx = max(1, min(int(selected_row), len(rows))) - 1
     row = rows[idx]
@@ -644,6 +722,7 @@ def _load_row_settings(
         row["text"],
         gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(row.get("lora_key"))),
         gr.update(choices=presets, value=row.get("preset_id")),
+        _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
     )
 
 
@@ -651,6 +730,7 @@ def _apply_row_settings(
     selected_row: int,
     row_lora_value: str,
     row_preset: str,
+    row_speech_rate: float,
     rows: list[dict[str, Any]],
     adapters: list[dict[str, Any]],
 ):
@@ -659,9 +739,15 @@ def _apply_row_settings(
     idx = max(1, min(int(selected_row), len(rows))) - 1
     row = rows[idx]
     lora_key = _lora_key_from_value(row_lora_value)
-    changed = (row.get("lora_key") != lora_key) or (row.get("preset_id") != row_preset)
+    speech_rate = _normalize_speech_rate(row_speech_rate, DEFAULT_SPEECH_RATE)
+    changed = (
+        (row.get("lora_key") != lora_key)
+        or (row.get("preset_id") != row_preset)
+        or (_normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE) != speech_rate)
+    )
     row["lora_key"] = lora_key
     row["preset_id"] = row_preset
+    row["speech_rate"] = speech_rate
     if changed:
         row["cache_key"] = None
         row["audio_b64"] = None
@@ -703,12 +789,14 @@ def _apply_table_edits(
         text = str(cells[1] if len(cells) > 1 else "")
         lora_key = _parse_lora_key_from_table_cell(cells[2] if len(cells) > 2 else None)
         preset_id = str(cells[3] if len(cells) > 3 else "").strip()
+        speech_rate = _normalize_speech_rate(cells[4] if len(cells) > 4 else DEFAULT_SPEECH_RATE, DEFAULT_SPEECH_RATE)
 
         row = {
             "idx": new_idx,
             "text": text,
             "lora_key": lora_key,
             "preset_id": preset_id,
+            "speech_rate": speech_rate,
             "status": "pending",
             "audio_b64": None,
             "cache_key": None,
@@ -719,12 +807,17 @@ def _apply_table_edits(
                 old.get("text") == text
                 and old.get("lora_key") == lora_key
                 and str(old.get("preset_id") or "") == preset_id
+                and _normalize_speech_rate(old.get("speech_rate"), DEFAULT_SPEECH_RATE) == speech_rate
             )
             if same:
                 row["status"] = old.get("status", "pending")
                 row["audio_b64"] = old.get("audio_b64")
                 row["cache_key"] = old.get("cache_key")
                 row["sample_rate"] = old.get("sample_rate")
+                row["speech_rate"] = _normalize_speech_rate(
+                    old.get("speech_rate"),
+                    DEFAULT_SPEECH_RATE,
+                )
             else:
                 changed_count += 1
         else:
@@ -739,6 +832,7 @@ def _insert_row_below(
     selected_row: int,
     row_lora_value: str,
     row_preset: str,
+    row_speech_rate: float,
     rows: list[dict[str, Any]],
     adapters: list[dict[str, Any]],
     presets: list[str],
@@ -748,12 +842,14 @@ def _insert_row_below(
         insert_idx = max(1, min(int(selected_row), len(rows)))
     lora_key = _lora_key_from_value(row_lora_value)
     preset = (row_preset or "").strip() or (presets[0] if presets else "")
+    speech_rate = _normalize_speech_rate(row_speech_rate, DEFAULT_SPEECH_RATE)
 
     new_row = {
         "idx": 0,
         "text": "",
         "lora_key": lora_key,
         "preset_id": preset,
+        "speech_rate": speech_rate,
         "status": "pending",
         "audio_b64": None,
         "cache_key": None,
@@ -771,6 +867,7 @@ def _insert_row_below(
         "",
         gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(new_row.get("lora_key"))),
         gr.update(choices=presets, value=new_row.get("preset_id")),
+        _normalize_speech_rate(new_row.get("speech_rate"), DEFAULT_SPEECH_RATE),
         f"row {selected} inserted",
     )
 
@@ -789,6 +886,7 @@ def _delete_selected_row(
             "",
             gr.update(choices=_lora_choices(adapters), value=NONE_LORA_VALUE),
             gr.update(choices=presets, value=(presets[0] if presets else None)),
+            DEFAULT_SPEECH_RATE,
             "no rows",
         )
     idx = max(1, min(int(selected_row), len(rows))) - 1
@@ -803,6 +901,7 @@ def _delete_selected_row(
             "",
             gr.update(choices=_lora_choices(adapters), value=NONE_LORA_VALUE),
             gr.update(choices=presets, value=(presets[0] if presets else None)),
+            DEFAULT_SPEECH_RATE,
             f"row {removed['idx']} deleted",
         )
     new_selected = max(1, min(idx + 1, len(rows)))
@@ -814,6 +913,7 @@ def _delete_selected_row(
         row["text"],
         gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(row.get("lora_key"))),
         gr.update(choices=presets, value=row.get("preset_id")),
+        _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
         f"row {removed['idx']} deleted",
     )
 
@@ -1099,17 +1199,24 @@ def build_app() -> gr.Blocks:
                 choices=_lora_choices(adapters),
                 value=default_lora_value,
             )
+            default_speech_rate = gr.Slider(
+                MIN_SPEECH_RATE,
+                MAX_SPEECH_RATE,
+                value=DEFAULT_SPEECH_RATE,
+                step=0.05,
+                label="Default Speech Rate For New Rows",
+            )
             split_btn = gr.Button("Split Into Lines")
             clear_cache_btn = gr.Button("Clear Audio Cache")
 
         line_table = gr.Dataframe(
-            headers=["idx", "text", "lora", "preset", "status", "cached"],
-            datatype=["number", "str", "str", "str", "str", "str"],
+            headers=["idx", "text", "lora", "preset", "speech_rate", "status", "cached"],
+            datatype=["number", "str", "str", "str", "number", "str", "str"],
             value=[],
             wrap=False,
             interactive=True,
             max_height=840,
-            column_widths=["5%", "42%", "24%", "16%", "6%", "7%"],
+            column_widths=["5%", "37%", "24%", "14%", "8%", "6%", "6%"],
             label="TTS Rows (scrollable)",
             elem_id="tts-rows-table",
         )
@@ -1132,6 +1239,13 @@ def build_app() -> gr.Blocks:
                 value=preset_default,
                 allow_custom_value=True,
                 elem_id="row-preset",
+            )
+            row_speech_rate = gr.Slider(
+                MIN_SPEECH_RATE,
+                MAX_SPEECH_RATE,
+                value=DEFAULT_SPEECH_RATE,
+                step=0.05,
+                label="Row Speech Rate",
             )
 
         with gr.Accordion("Global Settings", open=False):
@@ -1179,7 +1293,7 @@ def build_app() -> gr.Blocks:
 
         split_btn.click(
             fn=_split_into_rows,
-            inputs=[long_text, default_preset, default_lora, adapters_state],
+            inputs=[long_text, default_preset, default_speech_rate, default_lora, adapters_state],
             outputs=[rows_state, line_table, selected_row, row_text, log_text],
         )
 
@@ -1196,43 +1310,49 @@ def build_app() -> gr.Blocks:
         ).then(
             fn=_load_row_settings,
             inputs=[selected_row, rows_state, adapters_state, presets_state],
-            outputs=[row_text, row_lora, row_preset],
+            outputs=[row_text, row_lora, row_preset, row_speech_rate],
         )
 
         line_table.select(fn=_on_table_select, outputs=[selected_row]).then(
             fn=_load_row_settings,
             inputs=[selected_row, rows_state, adapters_state, presets_state],
-            outputs=[row_text, row_lora, row_preset],
+            outputs=[row_text, row_lora, row_preset, row_speech_rate],
         )
 
         selected_row.change(
             fn=_load_row_settings,
             inputs=[selected_row, rows_state, adapters_state, presets_state],
-            outputs=[row_text, row_lora, row_preset],
+            outputs=[row_text, row_lora, row_preset, row_speech_rate],
         )
 
         row_lora.change(
             fn=_apply_row_settings,
-            inputs=[selected_row, row_lora, row_preset, rows_state, adapters_state],
+            inputs=[selected_row, row_lora, row_preset, row_speech_rate, rows_state, adapters_state],
             outputs=[rows_state, line_table, log_text],
         )
 
         row_preset.change(
             fn=_apply_row_settings,
-            inputs=[selected_row, row_lora, row_preset, rows_state, adapters_state],
+            inputs=[selected_row, row_lora, row_preset, row_speech_rate, rows_state, adapters_state],
+            outputs=[rows_state, line_table, log_text],
+        )
+
+        row_speech_rate.change(
+            fn=_apply_row_settings,
+            inputs=[selected_row, row_lora, row_preset, row_speech_rate, rows_state, adapters_state],
             outputs=[rows_state, line_table, log_text],
         )
 
         delete_row_btn.click(
             fn=_delete_selected_row,
             inputs=[selected_row, rows_state, adapters_state, presets_state],
-            outputs=[rows_state, line_table, selected_row, row_text, row_lora, row_preset, log_text],
+            outputs=[rows_state, line_table, selected_row, row_text, row_lora, row_preset, row_speech_rate, log_text],
         )
 
         insert_row_btn.click(
             fn=_insert_row_below,
-            inputs=[selected_row, row_lora, row_preset, rows_state, adapters_state, presets_state],
-            outputs=[rows_state, line_table, selected_row, row_text, row_lora, row_preset, log_text],
+            inputs=[selected_row, row_lora, row_preset, row_speech_rate, rows_state, adapters_state, presets_state],
+            outputs=[rows_state, line_table, selected_row, row_text, row_lora, row_preset, row_speech_rate, log_text],
         )
 
         process_row_btn.click(

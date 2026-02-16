@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -113,6 +114,7 @@ async def tts_file(
     repetition_penalty: float | None = Form(None),
     presence_penalty: float | None = Form(None),
     frequency_penalty: float | None = Form(None),
+    speech_rate: float | None = Form(None),
     output_format: str | None = Form(None),
     best_of_n_enabled: bool | None = Form(None),
     best_of_n_n: int | None = Form(None),
@@ -157,6 +159,7 @@ async def tts_file(
             ),
             output=OutputConfig(format=output_format),
             best_of_n=best_of_n,
+            speech_rate=speech_rate,
         )
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
@@ -402,6 +405,10 @@ async def _run_tts(
 
     codec_sample_rate = codec_service.sample_rate
 
+    speech_rate = request.speech_rate if request.speech_rate is not None else 1.0
+    if abs(float(speech_rate) - 1.0) > 1e-6:
+        audio = _apply_speech_rate(audio, float(speech_rate))
+
     t4 = time.perf_counter()
 
     audio_sec = 0.0
@@ -589,6 +596,19 @@ def _resolve_output_format(output: OutputConfig | None, default_format: str) -> 
     if output and output.format:
         return output.format
     return default_format
+
+
+def _apply_speech_rate(audio: torch.Tensor, speech_rate: float) -> torch.Tensor:
+    if speech_rate <= 0:
+        return audio
+    audio = audio.float().flatten()
+    src_len = int(audio.numel())
+    if src_len <= 1:
+        return audio
+    dst_len = max(1, int(round(src_len / speech_rate)))
+    if dst_len == src_len:
+        return audio
+    return F.interpolate(audio.view(1, 1, -1), size=dst_len, mode="linear", align_corners=False).view(-1)
 
 
 def _trim_reference(waveform: torch.Tensor, sample_rate: int, max_seconds: float) -> torch.Tensor:

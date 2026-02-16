@@ -40,6 +40,7 @@ class TTSRequest(BaseModel):
     llm: LLMParams | None = None
     output: OutputConfig | None = None
     best_of_n: BestOfNConfig | None = None
+    speech_rate: float | None = Field(default=None, ge=0.5, le=2.0)
 
 
 class TTSTimings(BaseModel):
