@@ -506,25 +506,62 @@ def _lora_choices(adapters: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return choices
 
 
-def _lora_key_from_value(value: str | None) -> str | None:
-    if not value or value == NONE_LORA_VALUE:
-        return None
-    if value.startswith("path:"):
-        return value.split(":", 1)[1]
-    return None
-
-
 def _parse_lora_key_from_table_cell(value: Any) -> str | None:
     text = str(value or "").strip()
     if not text:
         return None
+    # Keep only the first token if accidental CSV-like text was pasted.
+    if "," in text:
+        text = text.split(",", 1)[0].strip()
     lowered = text.lower()
     if lowered in {"none", "(none)", "__none__"}:
         return None
-    if text.startswith("path:"):
+    while text.lower().startswith("path:"):
         text = text.split(":", 1)[1].strip()
-    text = re.sub(r"\s+\((id:\d+|not loaded|missing)\)\s*$", "", text, flags=re.IGNORECASE)
-    return text or None
+
+    lead_anno = re.compile(r"^\s*\((?:id:\d+|not loaded|missing)\)\s*", flags=re.IGNORECASE)
+    tail_anno = re.compile(r"\s*\((?:id:\d+|not loaded|missing)\)\s*$", flags=re.IGNORECASE)
+    prev = None
+    while prev != text:
+        prev = text
+        text = lead_anno.sub("", text)
+        text = tail_anno.sub("", text)
+        text = text.strip()
+
+    if text and not text.startswith("\\"):
+        first_bs = text.find("\\")
+        if first_bs >= 0:
+            text = text[first_bs:]
+
+    match = re.search(r"(\\[^,\r\n]*?\.gguf)", text, flags=re.IGNORECASE)
+    if match:
+        text = match.group(1)
+
+    text = text.strip()
+    if not text:
+        return None
+    if text.lower() in {"none", "(none)", "__none__"}:
+        return None
+    return text
+
+
+def _is_known_lora_key(lora_key: str | None, adapters: list[dict[str, Any]]) -> bool:
+    if not lora_key:
+        return False
+    target = str(lora_key)
+    for item in adapters:
+        if str(item.get("display") or "") == target:
+            return True
+    return False
+
+
+def _lora_key_from_value(value: str | None, adapters: list[dict[str, Any]] | None = None) -> str | None:
+    lora_key = _parse_lora_key_from_table_cell(value)
+    if lora_key is None:
+        return None
+    if adapters is not None and not _is_known_lora_key(lora_key, adapters):
+        return None
+    return lora_key
 
 
 def _normalize_speech_rate(value: Any, default: float = DEFAULT_SPEECH_RATE) -> float:
@@ -537,10 +574,13 @@ def _normalize_speech_rate(value: Any, default: float = DEFAULT_SPEECH_RATE) -> 
     return float(min(MAX_SPEECH_RATE, max(MIN_SPEECH_RATE, rate)))
 
 
-def _lora_value_from_key(lora_key: str | None) -> str:
-    if not lora_key:
+def _lora_value_from_key(lora_key: str | None, adapters: list[dict[str, Any]] | None = None) -> str:
+    normalized = _parse_lora_key_from_table_cell(lora_key)
+    if not normalized:
         return NONE_LORA_VALUE
-    return f"path:{lora_key}"
+    if adapters is not None and not _is_known_lora_key(normalized, adapters):
+        return NONE_LORA_VALUE
+    return f"path:{normalized}"
 
 
 def _lora_label(lora_key: str | None, adapters: list[dict[str, Any]]) -> str:
@@ -763,7 +803,7 @@ def _split_into_rows(
     adapters: list[dict[str, Any]],
 ):
     lines = _split_text_to_lines(long_text)
-    default_lora_key = _lora_key_from_value(default_lora_value)
+    default_lora_key = _lora_key_from_value(default_lora_value, adapters)
     rows: list[dict[str, Any]] = []
     for i, line in enumerate(lines, start=1):
         rows.append(
@@ -823,7 +863,7 @@ def _load_row_settings(
     row = rows[idx]
     return (
         row["text"],
-        gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(row.get("lora_key"))),
+        gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(row.get("lora_key"), adapters)),
         gr.update(choices=presets, value=row.get("preset_id")),
         _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
     )
@@ -841,7 +881,7 @@ def _apply_row_settings(
         return rows, _rows_table(rows, adapters), "no rows"
     idx = max(1, min(int(selected_row), len(rows))) - 1
     row = rows[idx]
-    lora_key = _lora_key_from_value(row_lora_value)
+    lora_key = _lora_key_from_value(row_lora_value, adapters)
     speech_rate = _normalize_speech_rate(row_speech_rate, DEFAULT_SPEECH_RATE)
     changed = (
         (row.get("lora_key") != lora_key)
@@ -861,6 +901,7 @@ def _apply_row_settings(
 
 def _parse_row_settings_clipboard_payload(
     clipboard_text: str,
+    adapters: list[dict[str, Any]],
 ) -> tuple[str | None, str, float] | None:
     text = str(clipboard_text or "").strip()
     if not text:
@@ -878,7 +919,7 @@ def _parse_row_settings_clipboard_payload(
     lora_raw = payload.get("lora_key")
     if lora_raw is None:
         lora_raw = payload.get("lora")
-    lora_key = _parse_lora_key_from_table_cell(lora_raw)
+    lora_key = _lora_key_from_value(str(lora_raw or ""), adapters)
     preset_id = str(payload.get("preset_id") or payload.get("preset") or "").strip()
     speech_rate = _normalize_speech_rate(payload.get("speech_rate"), DEFAULT_SPEECH_RATE)
     return lora_key, preset_id, speech_rate
@@ -889,9 +930,10 @@ def _copy_row_settings(selected_row: int, rows: list[dict[str, Any]]):
         return "", "copy settings: no rows"
     idx = max(1, min(int(selected_row), len(rows))) - 1
     row = rows[idx]
+    lora_key = _parse_lora_key_from_table_cell(row.get("lora_key"))
     payload = {
         "type": _ROW_SETTINGS_CLIPBOARD_TYPE,
-        "lora_key": row.get("lora_key"),
+        "lora_key": lora_key,
         "preset_id": str(row.get("preset_id") or ""),
         "speech_rate": _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
     }
@@ -907,7 +949,7 @@ def _paste_row_settings(
 ):
     if not rows:
         return rows, _rows_table(rows, adapters), "paste settings: no rows"
-    parsed = _parse_row_settings_clipboard_payload(clipboard_text)
+    parsed = _parse_row_settings_clipboard_payload(clipboard_text, adapters)
     if parsed is None:
         return rows, _rows_table(rows, adapters), "paste settings: clipboard is not row settings"
 
@@ -1014,7 +1056,7 @@ def _insert_row_below(
     insert_idx = 0
     if rows:
         insert_idx = max(1, min(int(selected_row), len(rows)))
-    lora_key = _lora_key_from_value(row_lora_value)
+    lora_key = _lora_key_from_value(row_lora_value, adapters)
     preset = (row_preset or "").strip() or (presets[0] if presets else "")
     speech_rate = _normalize_speech_rate(row_speech_rate, DEFAULT_SPEECH_RATE)
 
@@ -1039,7 +1081,7 @@ def _insert_row_below(
         _rows_table(rows, adapters),
         selected,
         "",
-        gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(new_row.get("lora_key"))),
+        gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(new_row.get("lora_key"), adapters)),
         gr.update(choices=presets, value=new_row.get("preset_id")),
         _normalize_speech_rate(new_row.get("speech_rate"), DEFAULT_SPEECH_RATE),
         f"row {selected} inserted",
@@ -1085,7 +1127,7 @@ def _delete_selected_row(
         _rows_table(rows, adapters),
         new_selected,
         row["text"],
-        gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(row.get("lora_key"))),
+        gr.update(choices=_lora_choices(adapters), value=_lora_value_from_key(row.get("lora_key"), adapters)),
         gr.update(choices=presets, value=row.get("preset_id")),
         _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
         f"row {removed['idx']} deleted",
@@ -1373,6 +1415,7 @@ def build_app() -> gr.Blocks:
                 label=r"Default LoRA For New Rows (from .\loras)",
                 choices=_lora_choices(adapters),
                 value=default_lora_value,
+                allow_custom_value=True,
             )
             default_speech_rate = gr.Slider(
                 MIN_SPEECH_RATE,
@@ -1414,6 +1457,7 @@ def build_app() -> gr.Blocks:
                 label=r"Row LoRA (from .\loras)",
                 choices=_lora_choices(adapters),
                 value=NONE_LORA_VALUE,
+                allow_custom_value=True,
                 elem_id="row-lora",
             )
             row_preset = gr.Dropdown(
