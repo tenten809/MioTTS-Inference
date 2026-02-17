@@ -81,6 +81,109 @@ UI_CSS = """
   overflow-y: auto !important;
   resize: none !important;
 }
+#shortcut-controls {
+  display: none !important;
+}
+"""
+_ROW_SETTINGS_CLIPBOARD_TYPE = "miotts.row_settings.v1"
+_ROW_SETTINGS_SHORTCUTS_JS = r"""
+<script>
+(() => {
+  if (window.__miottsLineBatchShortcutsRegistered) {
+    return;
+  }
+  window.__miottsLineBatchShortcutsRegistered = true;
+
+  const directTargets = ["row-lora", "row-preset", "row-speech-rate", "selected-row"];
+  const clickHostButton = (id) => {
+    const host = document.getElementById(id);
+    if (!host) return;
+    const btn = host.querySelector("button") || host;
+    if (typeof btn.click === "function") {
+      btn.click();
+    }
+  };
+  const parseColumnIndex = (el) => {
+    if (!el || !el.closest) return null;
+    const cell = el.closest("td,th,[role='gridcell']");
+    if (!cell) return null;
+
+    const dataCol = cell.getAttribute("data-col");
+    if (dataCol && /^-?\d+$/.test(dataCol)) {
+      return parseInt(dataCol, 10);
+    }
+
+    const ariaColIndex = cell.getAttribute("aria-colindex");
+    if (ariaColIndex && /^-?\d+$/.test(ariaColIndex)) {
+      return parseInt(ariaColIndex, 10) - 1;
+    }
+    return null;
+  };
+  const isTargetContext = (el, key) => {
+    if (!el || !el.closest) return false;
+    if (directTargets.some((id) => el.closest(`#${id}`))) {
+      return true;
+    }
+    const inTable = !!el.closest("#tts-rows-table");
+    if (!inTable) return false;
+
+    const col = parseColumnIndex(el);
+    if (col === 1) {
+      return false; // text column keeps native copy/paste
+    }
+    if (key === "c") {
+      const selectedText = (window.getSelection && window.getSelection().toString()) || "";
+      if (selectedText.trim()) {
+        return false;
+      }
+    }
+    return true;
+  };
+
+  document.addEventListener(
+    "keydown",
+    (evt) => {
+      if (!(evt.ctrlKey || evt.metaKey) || evt.altKey || evt.shiftKey) return;
+      const key = (evt.key || "").toLowerCase();
+      if (key !== "c" && key !== "v") return;
+      const active = document.activeElement;
+      if (!isTargetContext(active, key)) return;
+      evt.preventDefault();
+      clickHostButton(key === "c" ? "copy-row-settings-shortcut" : "paste-row-settings-shortcut");
+    },
+    true
+  );
+})();
+</script>
+"""
+_WRITE_ROW_SETTINGS_CLIPBOARD_JS = """
+(payload) => {
+  const text = (payload || "").toString();
+  window.__miottsRowSettingsClipboard = text;
+  if (!text) {
+    return;
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).catch(() => {});
+  }
+}
+"""
+_READ_ROW_SETTINGS_CLIPBOARD_JS = """
+async (selectedRow, cachedPayload, rows, adapters) => {
+  let text = (cachedPayload || "").toString();
+  if (navigator.clipboard && navigator.clipboard.readText) {
+    try {
+      const clipped = await navigator.clipboard.readText();
+      if (clipped && clipped.trim()) {
+        text = clipped;
+      }
+    } catch (err) {}
+  }
+  if ((!text || !text.trim()) && window.__miottsRowSettingsClipboard) {
+    text = window.__miottsRowSettingsClipboard;
+  }
+  return [selectedRow, text, rows, adapters];
+}
 """
 
 
@@ -756,6 +859,77 @@ def _apply_row_settings(
     return rows, _rows_table(rows, adapters), f"row {row['idx']} updated"
 
 
+def _parse_row_settings_clipboard_payload(
+    clipboard_text: str,
+) -> tuple[str | None, str, float] | None:
+    text = str(clipboard_text or "").strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    payload_type = str(payload.get("type") or "").strip()
+    if payload_type != _ROW_SETTINGS_CLIPBOARD_TYPE:
+        return None
+
+    lora_raw = payload.get("lora_key")
+    if lora_raw is None:
+        lora_raw = payload.get("lora")
+    lora_key = _parse_lora_key_from_table_cell(lora_raw)
+    preset_id = str(payload.get("preset_id") or payload.get("preset") or "").strip()
+    speech_rate = _normalize_speech_rate(payload.get("speech_rate"), DEFAULT_SPEECH_RATE)
+    return lora_key, preset_id, speech_rate
+
+
+def _copy_row_settings(selected_row: int, rows: list[dict[str, Any]]):
+    if not rows:
+        return "", "copy settings: no rows"
+    idx = max(1, min(int(selected_row), len(rows))) - 1
+    row = rows[idx]
+    payload = {
+        "type": _ROW_SETTINGS_CLIPBOARD_TYPE,
+        "lora_key": row.get("lora_key"),
+        "preset_id": str(row.get("preset_id") or ""),
+        "speech_rate": _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
+    }
+    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return text, f"row {row['idx']} settings copied"
+
+
+def _paste_row_settings(
+    selected_row: int,
+    clipboard_text: str,
+    rows: list[dict[str, Any]],
+    adapters: list[dict[str, Any]],
+):
+    if not rows:
+        return rows, _rows_table(rows, adapters), "paste settings: no rows"
+    parsed = _parse_row_settings_clipboard_payload(clipboard_text)
+    if parsed is None:
+        return rows, _rows_table(rows, adapters), "paste settings: clipboard is not row settings"
+
+    idx = max(1, min(int(selected_row), len(rows))) - 1
+    row = rows[idx]
+    lora_key, preset_id, speech_rate = parsed
+    changed = (
+        (row.get("lora_key") != lora_key)
+        or (str(row.get("preset_id") or "") != preset_id)
+        or (_normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE) != speech_rate)
+    )
+    row["lora_key"] = lora_key
+    row["preset_id"] = preset_id
+    row["speech_rate"] = speech_rate
+    if changed:
+        row["cache_key"] = None
+        row["audio_b64"] = None
+        row["sample_rate"] = None
+        row["status"] = "pending"
+    return rows, _rows_table(rows, adapters), f"row {row['idx']} settings pasted"
+
+
 def _apply_table_edits(
     table_value: Any,
     rows: list[dict[str, Any]],
@@ -1158,6 +1332,7 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(title="MioTTS Line Batch UI") as demo:
         gr.Markdown("# MioTTS Line Batch UI")
+        gr.HTML(_ROW_SETTINGS_SHORTCUTS_JS)
 
         rows_state = gr.State([])
         adapters_state = gr.State(adapters)
@@ -1220,9 +1395,17 @@ def build_app() -> gr.Blocks:
             label="TTS Rows (scrollable)",
             elem_id="tts-rows-table",
         )
+        with gr.Row(elem_id="shortcut-controls"):
+            copy_row_settings_shortcut = gr.Button("Copy Row Settings", elem_id="copy-row-settings-shortcut")
+            paste_row_settings_shortcut = gr.Button("Paste Row Settings", elem_id="paste-row-settings-shortcut")
+            row_settings_clipboard = gr.Textbox(
+                label="Row Settings Clipboard",
+                value="",
+                elem_id="row-settings-clipboard",
+            )
 
         with gr.Row():
-            selected_row = gr.Number(label="Selected Row (1-based)", value=0, precision=0)
+            selected_row = gr.Number(label="Selected Row (1-based)", value=0, precision=0, elem_id="selected-row")
             row_text = gr.Textbox(label="Selected Text", interactive=False)
             insert_row_btn = gr.Button("Insert Row Below", variant="secondary")
             delete_row_btn = gr.Button("Delete Selected Row", variant="secondary")
@@ -1246,6 +1429,7 @@ def build_app() -> gr.Blocks:
                 value=DEFAULT_SPEECH_RATE,
                 step=0.05,
                 label="Row Speech Rate",
+                elem_id="row-speech-rate",
             )
 
         with gr.Accordion("Global Settings", open=False):
@@ -1320,6 +1504,30 @@ def build_app() -> gr.Blocks:
         )
 
         selected_row.change(
+            fn=_load_row_settings,
+            inputs=[selected_row, rows_state, adapters_state, presets_state],
+            outputs=[row_text, row_lora, row_preset, row_speech_rate],
+        )
+
+        copy_row_settings_shortcut.click(
+            fn=_copy_row_settings,
+            inputs=[selected_row, rows_state],
+            outputs=[row_settings_clipboard, log_text],
+        )
+
+        row_settings_clipboard.change(
+            fn=None,
+            inputs=[row_settings_clipboard],
+            outputs=[],
+            js=_WRITE_ROW_SETTINGS_CLIPBOARD_JS,
+        )
+
+        paste_row_settings_shortcut.click(
+            fn=_paste_row_settings,
+            inputs=[selected_row, row_settings_clipboard, rows_state, adapters_state],
+            outputs=[rows_state, line_table, log_text],
+            js=_READ_ROW_SETTINGS_CLIPBOARD_JS,
+        ).then(
             fn=_load_row_settings,
             inputs=[selected_row, rows_state, adapters_state, presets_state],
             outputs=[row_text, row_lora, row_preset, row_speech_rate],
