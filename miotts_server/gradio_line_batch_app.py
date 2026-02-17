@@ -95,6 +95,22 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
   window.__miottsLineBatchShortcutsRegistered = true;
 
   const directTargets = ["row-lora", "row-preset", "row-speech-rate", "selected-row"];
+  let shortcutGuardUntil = 0;
+
+  const getEventElement = (evt) => {
+    const t = evt && evt.target;
+    if (t && typeof t.closest === "function") {
+      return t;
+    }
+    return document.activeElement;
+  };
+  const stopDefault = (evt) => {
+    evt.preventDefault();
+    evt.stopPropagation();
+    if (typeof evt.stopImmediatePropagation === "function") {
+      evt.stopImmediatePropagation();
+    }
+  };
   const clickHostButton = (id) => {
     const host = document.getElementById(id);
     if (!host) return;
@@ -102,6 +118,10 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
     if (typeof btn.click === "function") {
       btn.click();
     }
+  };
+  const runShortcut = (key) => {
+    shortcutGuardUntil = Date.now() + 180;
+    clickHostButton(key === "c" ? "copy-row-settings-shortcut" : "paste-row-settings-shortcut");
   };
   const parseColumnIndex = (el) => {
     if (!el || !el.closest) return null;
@@ -131,13 +151,15 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
     if (col === 1) {
       return false; // text column keeps native copy/paste
     }
-    if (key === "c") {
-      const selectedText = (window.getSelection && window.getSelection().toString()) || "";
-      if (selectedText.trim()) {
-        return false;
-      }
-    }
     return true;
+  };
+
+  const shouldHandle = (evt, key) => {
+    const target = getEventElement(evt);
+    if (isTargetContext(target, key)) return true;
+    const active = document.activeElement;
+    if (isTargetContext(active, key)) return true;
+    return false;
   };
 
   document.addEventListener(
@@ -146,10 +168,31 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
       if (!(evt.ctrlKey || evt.metaKey) || evt.altKey || evt.shiftKey) return;
       const key = (evt.key || "").toLowerCase();
       if (key !== "c" && key !== "v") return;
-      const active = document.activeElement;
-      if (!isTargetContext(active, key)) return;
-      evt.preventDefault();
-      clickHostButton(key === "c" ? "copy-row-settings-shortcut" : "paste-row-settings-shortcut");
+      if (!shouldHandle(evt, key)) return;
+      stopDefault(evt);
+      runShortcut(key);
+    },
+    true
+  );
+
+  document.addEventListener(
+    "copy",
+    (evt) => {
+      if (Date.now() < shortcutGuardUntil) return;
+      if (!shouldHandle(evt, "c")) return;
+      stopDefault(evt);
+      runShortcut("c");
+    },
+    true
+  );
+
+  document.addEventListener(
+    "paste",
+    (evt) => {
+      if (Date.now() < shortcutGuardUntil) return;
+      if (!shouldHandle(evt, "v")) return;
+      stopDefault(evt);
+      runShortcut("v");
     },
     true
   );
