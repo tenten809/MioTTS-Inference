@@ -95,7 +95,9 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
   window.__miottsLineBatchShortcutsRegistered = true;
 
   const directTargets = ["row-lora", "row-preset", "row-speech-rate", "selected-row"];
+  const CONTEXT_TTL_MS = 4000;
   let shortcutGuardUntil = 0;
+  let rememberedContextUntil = 0;
 
   const getEventElement = (evt) => {
     const t = evt && evt.target;
@@ -139,7 +141,7 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
     }
     return null;
   };
-  const isTargetContext = (el, key) => {
+  const isTargetContext = (el) => {
     if (!el || !el.closest) return false;
     if (directTargets.some((id) => el.closest(`#${id}`))) {
       return true;
@@ -154,13 +156,53 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
     return true;
   };
 
-  const shouldHandle = (evt, key) => {
+  const isTextContext = (el) => {
+    if (!el || !el.closest) return false;
+    if (el.closest("#long-text-input")) return true;
+    if (!el.closest("#tts-rows-table")) return false;
+    const col = parseColumnIndex(el);
+    return col === 1;
+  };
+
+  const rememberContextFrom = (el) => {
+    if (isTargetContext(el)) {
+      rememberedContextUntil = Date.now() + CONTEXT_TTL_MS;
+      return;
+    }
+    if (isTextContext(el)) {
+      rememberedContextUntil = 0;
+    }
+  };
+
+  const shouldHandle = (evt) => {
     const target = getEventElement(evt);
-    if (isTargetContext(target, key)) return true;
+    rememberContextFrom(target);
+    if (isTargetContext(target)) return true;
     const active = document.activeElement;
-    if (isTargetContext(active, key)) return true;
+    rememberContextFrom(active);
+    if (isTargetContext(active)) return true;
+    if (Date.now() < rememberedContextUntil) {
+      if (isTextContext(target) || isTextContext(active)) return false;
+      return true;
+    }
     return false;
   };
+
+  document.addEventListener(
+    "pointerdown",
+    (evt) => {
+      rememberContextFrom(getEventElement(evt));
+    },
+    true
+  );
+
+  document.addEventListener(
+    "focusin",
+    (evt) => {
+      rememberContextFrom(getEventElement(evt));
+    },
+    true
+  );
 
   document.addEventListener(
     "keydown",
@@ -168,7 +210,7 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
       if (!(evt.ctrlKey || evt.metaKey) || evt.altKey || evt.shiftKey) return;
       const key = (evt.key || "").toLowerCase();
       if (key !== "c" && key !== "v") return;
-      if (!shouldHandle(evt, key)) return;
+      if (!shouldHandle(evt)) return;
       stopDefault(evt);
       runShortcut(key);
     },
@@ -179,7 +221,7 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
     "copy",
     (evt) => {
       if (Date.now() < shortcutGuardUntil) return;
-      if (!shouldHandle(evt, "c")) return;
+      if (!shouldHandle(evt)) return;
       stopDefault(evt);
       runShortcut("c");
     },
@@ -190,7 +232,7 @@ _ROW_SETTINGS_SHORTCUTS_JS = r"""
     "paste",
     (evt) => {
       if (Date.now() < shortcutGuardUntil) return;
-      if (!shouldHandle(evt, "v")) return;
+      if (!shouldHandle(evt)) return;
       stopDefault(evt);
       runShortcut("v");
     },
