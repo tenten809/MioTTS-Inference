@@ -1459,7 +1459,6 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(title="MioTTS Line Batch UI") as demo:
         gr.Markdown("# MioTTS Line Batch UI")
-        gr.HTML(_ROW_SETTINGS_SHORTCUTS_JS)
 
         rows_state = gr.State([])
         adapters_state = gr.State(adapters)
@@ -1533,10 +1532,23 @@ def build_app() -> gr.Blocks:
             )
 
         with gr.Row():
-            selected_row = gr.Number(label="Selected Row (1-based)", value=0, precision=0, elem_id="selected-row")
-            row_text = gr.Textbox(label="Selected Text", interactive=False)
-            insert_row_btn = gr.Button("Insert Row Below", variant="secondary")
-            delete_row_btn = gr.Button("Delete Selected Row", variant="secondary")
+            with gr.Column(scale=1):
+                selected_row = gr.Number(label="Selected Row (1-based)", value=0, precision=0, elem_id="selected-row")
+            with gr.Column(scale=3):
+                row_text = gr.Textbox(label="Selected Text", interactive=False)
+            with gr.Column(scale=1):
+                settings_copy_btn = gr.Button("Settings Copy", variant="secondary", min_width=0)
+            with gr.Column(scale=1):
+                settings_paste_btn = gr.Button("Settings Paste", variant="secondary", min_width=0)
+        with gr.Row():
+            with gr.Column(scale=1):
+                pass
+            with gr.Column(scale=3):
+                pass
+            with gr.Column(scale=1):
+                insert_row_btn = gr.Button("Insert Row Below", variant="secondary", min_width=0)
+            with gr.Column(scale=1):
+                delete_row_btn = gr.Button("Delete Selected Row", variant="secondary", min_width=0)
         with gr.Row():
             row_lora = gr.Dropdown(
                 label=r"Row LoRA (from .\loras)",
@@ -1633,6 +1645,22 @@ def build_app() -> gr.Blocks:
         )
 
         selected_row.change(
+            fn=_load_row_settings,
+            inputs=[selected_row, rows_state, adapters_state, presets_state],
+            outputs=[row_text, row_lora, row_preset, row_speech_rate],
+        )
+
+        settings_copy_btn.click(
+            fn=_copy_row_settings,
+            inputs=[selected_row, rows_state],
+            outputs=[row_settings_clipboard, log_text],
+        )
+
+        settings_paste_btn.click(
+            fn=_paste_row_settings,
+            inputs=[selected_row, row_settings_clipboard, rows_state, adapters_state],
+            outputs=[rows_state, line_table, log_text],
+        ).then(
             fn=_load_row_settings,
             inputs=[selected_row, rows_state, adapters_state, presets_state],
             outputs=[row_text, row_lora, row_preset, row_speech_rate],
