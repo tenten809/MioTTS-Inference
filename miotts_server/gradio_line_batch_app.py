@@ -7,6 +7,8 @@ import io
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import unicodedata
@@ -23,9 +25,18 @@ DEFAULT_LLM_API_BASE = os.getenv("MIOTTS_LLM_BASE", "http://localhost:8000")
 DEFAULT_PRESETS_DIR = Path(os.getenv("MIOTTS_PRESETS_DIR", "presets")).expanduser()
 DEFAULT_LORAS_DIR = Path(os.getenv("MIOTTS_LORAS_DIR", "loras")).expanduser()
 DEFAULT_TEXT_REPLACE_CSV = Path(os.getenv("MIOTTS_TEXT_REPLACE_CSV", "text_replace_dict.csv")).expanduser()
+_DEFAULT_PADDLEOCR_DIR = Path(__file__).resolve().parent.parent / "PaddleOCR"
+DEFAULT_PADDLEOCR_DIR = Path(
+    os.getenv("MIOTTS_PADDLEOCR_DIR", str(_DEFAULT_PADDLEOCR_DIR))
+).expanduser()
+DEFAULT_PADDLEOCR_PYTHON = Path(
+    os.getenv("MIOTTS_PADDLEOCR_PYTHON", str(DEFAULT_PADDLEOCR_DIR / ".venv" / "Scripts" / "python.exe"))
+).expanduser()
+DEFAULT_PADDLEOCR_LANG = str(os.getenv("MIOTTS_PADDLEOCR_LANG", "japan")).strip() or "japan"
 NONE_LORA_VALUE = "__none__"
 PROCESS_LOCK = threading.Lock()
 UNKNOWN_LORA_STATE = {"id": "__unknown__", "scale": -1.0}
+_OCR_JSON_MARKER = "__MIOTTS_OCR_JSON__="
 _ASCII_TO_FULLWIDTH = str.maketrans({chr(i): chr(i + 0xFEE0) for i in range(33, 127)})
 _DAKUTEN_MARKS_RE = re.compile(r"[゛゜ﾞﾟ゙゚]")
 _DAKUTEN_WITH_SPACE_RE = re.compile(r"[ \t\u3000]*[゛゜ﾞﾟ゙゚]")
@@ -495,6 +506,138 @@ def _split_text_to_lines(text: str) -> list[str]:
             if sentence:
                 lines.append(sentence)
     return lines
+
+
+def _resolve_image_path(image_input: Any) -> Path | None:
+    if isinstance(image_input, Path):
+        path = image_input
+    elif isinstance(image_input, str):
+        path = Path(image_input)
+    elif isinstance(image_input, dict):
+        raw = image_input.get("path") or image_input.get("name")
+        if not raw:
+            return None
+        path = Path(str(raw))
+    else:
+        return None
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception:
+        return None
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    return resolved
+
+
+def _resolve_paddleocr_python() -> Path:
+    candidates: list[Path] = []
+    env_python = str(os.getenv("MIOTTS_PADDLEOCR_PYTHON", "")).strip()
+    if env_python:
+        candidates.append(Path(env_python).expanduser())
+    candidates.append(DEFAULT_PADDLEOCR_PYTHON)
+    candidates.append(Path(sys.executable))
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        if resolved.exists() and resolved.is_file():
+            return resolved
+    return candidates[0]
+
+
+def _extract_ocr_text_via_subprocess(image_input: Any, ocr_lang: str) -> str:
+    image_path = _resolve_image_path(image_input)
+    if image_path is None:
+        raise ValueError("OCR image is missing or invalid.")
+
+    try:
+        paddle_dir = DEFAULT_PADDLEOCR_DIR.resolve()
+    except Exception as exc:
+        raise RuntimeError(f"invalid PaddleOCR directory: {DEFAULT_PADDLEOCR_DIR}") from exc
+    if not paddle_dir.exists():
+        raise RuntimeError(f"PaddleOCR directory not found: {paddle_dir}")
+
+    paddle_python = _resolve_paddleocr_python()
+    lang = str(ocr_lang or "").strip() or DEFAULT_PADDLEOCR_LANG
+    script = r"""
+import json
+import sys
+
+from paddleocr import PaddleOCR
+
+image_path = sys.argv[1]
+lang = sys.argv[2]
+ocr = PaddleOCR(
+    lang=lang,
+    use_doc_orientation_classify=False,
+    use_doc_unwarping=False,
+    use_textline_orientation=False,
+)
+result = ocr.predict(input=image_path)
+texts = []
+for item in result:
+    payload = getattr(item, "json", None)
+    if callable(payload):
+        try:
+            payload = payload()
+        except Exception:
+            payload = None
+    if not isinstance(payload, dict):
+        continue
+    content = payload.get("res", payload)
+    if not isinstance(content, dict):
+        continue
+    rec_texts = content.get("rec_texts")
+    if not isinstance(rec_texts, list):
+        continue
+    for text in rec_texts:
+        val = str(text or "").strip()
+        if val:
+            texts.append(val)
+print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_ascii=False))
+"""
+    env = dict(os.environ)
+    env.setdefault("PYTHONUTF8", "1")
+    proc = subprocess.run(
+        [str(paddle_python), "-c", script, str(image_path), lang],
+        cwd=str(paddle_dir),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=600,
+        env=env,
+    )
+
+    payload_line = ""
+    for line in reversed((proc.stdout or "").splitlines()):
+        if line.startswith(_OCR_JSON_MARKER):
+            payload_line = line[len(_OCR_JSON_MARKER) :].strip()
+            break
+    if not payload_line:
+        stderr_tail = "\n".join((proc.stderr or "").splitlines()[-8:]).strip()
+        stdout_tail = "\n".join((proc.stdout or "").splitlines()[-8:]).strip()
+        detail = stderr_tail or stdout_tail or f"exit={proc.returncode}"
+        raise RuntimeError(f"OCR subprocess failed: {detail}")
+
+    try:
+        payload = json.loads(payload_line)
+    except Exception as exc:
+        raise RuntimeError("OCR subprocess returned invalid JSON payload.") from exc
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise RuntimeError("OCR returned no text.")
+    return text
+
+
+def _fill_long_text_from_ocr(image_input: Any, current_long_text: str, ocr_lang: str):
+    current = str(current_long_text or "")
+    try:
+        text = _extract_ocr_text_via_subprocess(image_input=image_input, ocr_lang=ocr_lang)
+    except Exception as exc:
+        return current, f"ocr failed: {exc}"
+    return text, f"ocr ok: {len(text)} chars loaded into Long Text Input"
 
 
 def _fetch_presets_from_dir(presets_dir: Path | str) -> list[str]:
@@ -1480,6 +1623,26 @@ def build_app() -> gr.Blocks:
 
         refresh_msg = gr.Markdown()
 
+        with gr.Accordion("Image OCR (PaddleOCR subprocess)", open=False):
+            with gr.Row():
+                ocr_image = gr.Image(
+                    label="Drop Image For OCR",
+                    type="filepath",
+                    sources=["upload"],
+                    height=240,
+                )
+                with gr.Column():
+                    ocr_lang = gr.Dropdown(
+                        label="OCR Language",
+                        choices=["japan", "ch", "en"],
+                        value=DEFAULT_PADDLEOCR_LANG,
+                        allow_custom_value=True,
+                    )
+                    ocr_btn = gr.Button("Read Text From Image")
+                    gr.Markdown(
+                        f"Uses subprocess: `{DEFAULT_PADDLEOCR_PYTHON}` (cwd: `{DEFAULT_PADDLEOCR_DIR}`)"
+                    )
+
         with gr.Row():
             long_text = gr.Textbox(
                 label="Long Text Input",
@@ -1620,6 +1783,12 @@ def build_app() -> gr.Blocks:
             fn=_split_into_rows,
             inputs=[long_text, default_preset, default_speech_rate, default_lora, adapters_state],
             outputs=[rows_state, line_table, selected_row, row_text, log_text],
+        )
+
+        ocr_btn.click(
+            fn=_fill_long_text_from_ocr,
+            inputs=[ocr_image, long_text, ocr_lang],
+            outputs=[long_text, log_text],
         )
 
         clear_cache_btn.click(

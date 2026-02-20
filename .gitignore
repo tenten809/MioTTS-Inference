@@ -3,6 +3,7 @@ presets/
 data/
 outputs/
 loras/
+PaddleOCR/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
