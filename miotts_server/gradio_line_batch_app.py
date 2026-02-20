@@ -706,7 +706,7 @@ def _clean_ocr_texts(rec_texts: Any) -> list[str]:
     return out
 
 
-def _poly_to_box(poly: Any) -> tuple[float, float, float, float] | None:
+def _poly_to_box(poly: Any) -> tuple[float, float, float, float, float, float] | None:
     if not isinstance(poly, (list, tuple)):
         return None
     xs: list[float] = []
@@ -731,7 +731,7 @@ def _poly_to_box(poly: Any) -> tuple[float, float, float, float] | None:
     h = max(1e-6, y1 - y0)
     cx = (x0 + x1) * 0.5
     cy = (y0 + y1) * 0.5
-    return cx, cy, w, h
+    return cx, cy, w, h, x0, x1
 
 
 def _build_ocr_items(rec_texts: Any, rec_polys: Any) -> list[dict[str, float | str]]:
@@ -751,8 +751,8 @@ def _build_ocr_items(rec_texts: Any, rec_polys: Any) -> list[dict[str, float | s
         box = _poly_to_box(poly)
         if box is None:
             continue
-        cx, cy, w, h = box
-        items.append({"text": text, "cx": cx, "cy": cy, "w": w, "h": h})
+        cx, cy, w, h, x0, x1 = box
+        items.append({"text": text, "cx": cx, "cy": cy, "w": w, "h": h, "x0": x0, "x1": x1})
     return items
 
 
@@ -773,29 +773,54 @@ def _reorder_vertical_rtl(items: list[dict[str, float | str]]) -> list[str]:
     if not items:
         return []
 
-    widths = sorted(float(item["w"]) for item in items if float(item["w"]) > 0)
-    median_w = widths[len(widths) // 2] if widths else 20.0
-    x_threshold = max(10.0, median_w * 1.6)
+    def _interval_overlap_ratio(a0: float, a1: float, b0: float, b1: float) -> float:
+        left = max(a0, b0)
+        right = min(a1, b1)
+        overlap = max(0.0, right - left)
+        denom = max(1e-6, min(a1 - a0, b1 - b0))
+        return overlap / denom
 
     columns: list[dict[str, Any]] = []
     for item in sorted(items, key=lambda x: float(x["cx"]), reverse=True):
         cx = float(item["cx"])
+        w = max(1e-6, float(item["w"]))
+        x0 = float(item["x0"])
+        x1 = float(item["x1"])
+
         best_idx = -1
-        best_dist = float("inf")
+        best_score = float("-inf")
         for idx, col in enumerate(columns):
-            dist = abs(cx - float(col["cx_mean"]))
-            if dist <= x_threshold and dist < best_dist:
+            col_x0 = float(col["x0"])
+            col_x1 = float(col["x1"])
+            col_cx = float(col["cx_mean"])
+            col_w = max(1e-6, float(col["w_mean"]))
+
+            overlap = _interval_overlap_ratio(x0, x1, col_x0, col_x1)
+            center_dist = abs(cx - col_cx)
+            dist_limit = max(col_w, w) * 0.7
+            if overlap < 0.10 and center_dist > dist_limit:
+                continue
+
+            # Higher overlap and shorter center distance are preferred.
+            score = overlap * 8.0 - (center_dist / max(1.0, max(col_w, w)))
+            if score > best_score:
+                best_score = score
                 best_idx = idx
-                best_dist = dist
+
         if best_idx < 0:
-            columns.append({"cx_mean": cx, "items": [item]})
+            columns.append({"x0": x0, "x1": x1, "cx_mean": cx, "w_mean": w, "items": [item]})
             continue
+
         col = columns[best_idx]
         col["items"].append(item)
         n = len(col["items"])
         col["cx_mean"] = (float(col["cx_mean"]) * float(n - 1) + cx) / float(n)
+        col["w_mean"] = (float(col["w_mean"]) * float(n - 1) + w) / float(n)
+        col["x0"] = min(float(col["x0"]), x0)
+        col["x1"] = max(float(col["x1"]), x1)
 
-    columns.sort(key=lambda c: float(c["cx_mean"]), reverse=True)
+    # Strict right -> left order by right edge (x1), then center x.
+    columns.sort(key=lambda c: (float(c["x1"]), float(c["cx_mean"])), reverse=True)
     ordered_lines: list[str] = []
     for col in columns:
         col_items = sorted(col["items"], key=lambda x: float(x["cy"]))
