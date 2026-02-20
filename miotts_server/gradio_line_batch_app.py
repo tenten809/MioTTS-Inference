@@ -99,6 +99,10 @@ UI_CSS = """
 #shortcut-controls {
   display: none !important;
 }
+#row-edit-actions button {
+  height: 40px !important;
+  white-space: nowrap !important;
+}
 """
 _ROW_SETTINGS_CLIPBOARD_TYPE = "miotts.row_settings.v1"
 _ROW_SETTINGS_SHORTCUTS_JS = r"""
@@ -2200,10 +2204,10 @@ def build_app() -> gr.Blocks:
                 pass
             with gr.Column(scale=3):
                 pass
-            with gr.Column(scale=1):
-                delete_row_btn = gr.Button("Delete Selected Row", variant="secondary", min_width=0)
-            with gr.Column(scale=1):
-                insert_row_btn = gr.Button("Insert Row Below", variant="secondary", min_width=0)
+            with gr.Column(scale=2):
+                with gr.Row(elem_id="row-edit-actions"):
+                    delete_row_btn = gr.Button("Delete Selected Row", variant="secondary", min_width=0)
+                    insert_row_btn = gr.Button("Insert Row Below", variant="secondary", min_width=0)
         with gr.Row():
             row_lora = gr.Dropdown(
                 label=r"Row LoRA (from .\loras)",
