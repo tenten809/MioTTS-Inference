@@ -33,6 +33,10 @@ DEFAULT_PADDLEOCR_PYTHON = Path(
     os.getenv("MIOTTS_PADDLEOCR_PYTHON", str(DEFAULT_PADDLEOCR_DIR / ".venv" / "Scripts" / "python.exe"))
 ).expanduser()
 DEFAULT_PADDLEOCR_LANG = str(os.getenv("MIOTTS_PADDLEOCR_LANG", "japan")).strip() or "japan"
+try:
+    DEFAULT_OCR_MAX_PIXELS = max(1, int(float(os.getenv("MIOTTS_OCR_MAX_PIXELS", str(1920 * 1080)))))
+except Exception:
+    DEFAULT_OCR_MAX_PIXELS = 1920 * 1080
 NONE_LORA_VALUE = "__none__"
 PROCESS_LOCK = threading.Lock()
 UNKNOWN_LORA_STATE = {"id": "__unknown__", "scale": -1.0}
@@ -595,6 +599,41 @@ def _resolve_image_path(image_input: Any) -> Path | None:
     return resolved
 
 
+def _prepare_ocr_image(image_path: Path) -> tuple[Path, str | None]:
+    if DEFAULT_OCR_MAX_PIXELS <= 0:
+        return image_path, None
+    try:
+        from PIL import Image, ImageOps
+    except Exception as exc:
+        raise RuntimeError("Pillow is required for OCR image resizing.") from exc
+
+    try:
+        with Image.open(image_path) as img:
+            img = ImageOps.exif_transpose(img)
+            width, height = img.size
+            pixels = int(width) * int(height)
+            if pixels <= DEFAULT_OCR_MAX_PIXELS:
+                return image_path, None
+
+            scale = (float(DEFAULT_OCR_MAX_PIXELS) / float(pixels)) ** 0.5
+            new_w = max(1, int(round(width * scale)))
+            new_h = max(1, int(round(height * scale)))
+            resampling = getattr(Image, "Resampling", Image)
+            resized = img.resize((new_w, new_h), resample=resampling.LANCZOS)
+            if resized.mode not in {"RGB", "RGBA", "L"}:
+                resized = resized.convert("RGB")
+
+            out_dir = Path("outputs/ocr_resized").resolve()
+            out_dir.mkdir(parents=True, exist_ok=True)
+            digest_src = f"{image_path}:{image_path.stat().st_mtime_ns}:{width}x{height}:{DEFAULT_OCR_MAX_PIXELS}"
+            digest = hashlib.sha1(digest_src.encode("utf-8")).hexdigest()[:12]
+            out_path = out_dir / f"{image_path.stem}_{new_w}x{new_h}_{digest}.png"
+            resized.save(out_path, format="PNG", optimize=True)
+            return out_path, f"resized {width}x{height} -> {new_w}x{new_h}"
+    except Exception as exc:
+        raise RuntimeError(f"failed to prepare OCR image: {exc}") from exc
+
+
 def _resolve_paddleocr_python() -> Path:
     candidates: list[Path] = []
     env_python = str(os.getenv("MIOTTS_PADDLEOCR_PYTHON", "")).strip()
@@ -653,10 +692,11 @@ def _build_paddle_subprocess_env(paddle_python: Path) -> dict[str, str]:
     return env
 
 
-def _extract_ocr_text_via_subprocess(image_input: Any, ocr_lang: str) -> str:
+def _extract_ocr_text_via_subprocess(image_input: Any, ocr_lang: str) -> tuple[str, str | None]:
     image_path = _resolve_image_path(image_input)
     if image_path is None:
         raise ValueError("OCR image is missing or invalid.")
+    input_for_ocr, resize_note = _prepare_ocr_image(image_path)
 
     try:
         paddle_dir = DEFAULT_PADDLEOCR_DIR.resolve()
@@ -706,7 +746,7 @@ print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_asc
 """
     env = _build_paddle_subprocess_env(paddle_python)
     proc = subprocess.run(
-        [str(paddle_python), "-c", script, str(image_path), lang],
+        [str(paddle_python), "-c", script, str(input_for_ocr), lang],
         cwd=str(paddle_dir),
         capture_output=True,
         text=True,
@@ -745,16 +785,19 @@ print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_asc
     text = str(payload.get("text") or "").strip()
     if not text:
         raise RuntimeError("OCR returned no text.")
-    return text
+    return text, resize_note
 
 
 def _fill_long_text_from_ocr(image_input: Any, current_long_text: str, ocr_lang: str):
     current = str(current_long_text or "")
     try:
-        text = _extract_ocr_text_via_subprocess(image_input=image_input, ocr_lang=ocr_lang)
+        text, resize_note = _extract_ocr_text_via_subprocess(image_input=image_input, ocr_lang=ocr_lang)
     except Exception as exc:
         return current, f"ocr failed: {exc}"
-    return text, f"ocr ok: {len(text)} chars loaded into Long Text Input"
+    msg = f"ocr ok: {len(text)} chars loaded into Long Text Input"
+    if resize_note:
+        msg = f"{msg} ({resize_note}, max {DEFAULT_OCR_MAX_PIXELS} px)"
+    return text, msg
 
 
 def _fetch_presets_from_dir(presets_dir: Path | str) -> list[str]:
