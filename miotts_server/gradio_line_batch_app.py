@@ -281,6 +281,72 @@ async (selectedRow, cachedPayload, rows, adapters) => {
   return [selectedRow, text, rows, adapters];
 }
 """
+_INIT_OCR_OVERWRITE_DROP_JS = r"""
+() => {
+  if (window.__miottsOcrOverwriteDropRegistered) return;
+  window.__miottsOcrOverwriteDropRegistered = true;
+
+  const findDropZone = (evtTarget) => {
+    if (!evtTarget || typeof evtTarget.closest !== "function") return null;
+    return evtTarget.closest("#ocr-image-drop");
+  };
+
+  const pickFirstImage = (dataTransfer) => {
+    const files = dataTransfer && dataTransfer.files;
+    if (!files || !files.length) return null;
+    for (const f of files) {
+      if (!f) continue;
+      if (!f.type || f.type.startsWith("image/")) {
+        return f;
+      }
+    }
+    return null;
+  };
+
+  const applyFileToInput = (zone, file) => {
+    const input = zone && zone.querySelector("input[type='file']");
+    if (!input) return false;
+    try {
+      const dt = new DataTransfer();
+      dt.items.add(file);
+      input.value = "";
+      input.files = dt.files;
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.dispatchEvent(new Event("change", { bubbles: true }));
+      return true;
+    } catch (err) {
+      return false;
+    }
+  };
+
+  document.addEventListener(
+    "dragover",
+    (evt) => {
+      const zone = findDropZone(evt.target);
+      if (!zone) return;
+      evt.preventDefault();
+      if (evt.dataTransfer) {
+        evt.dataTransfer.dropEffect = "copy";
+      }
+    },
+    true
+  );
+
+  document.addEventListener(
+    "drop",
+    (evt) => {
+      const zone = findDropZone(evt.target);
+      if (!zone) return;
+      const firstImage = pickFirstImage(evt.dataTransfer);
+      if (!firstImage) return;
+      evt.preventDefault();
+      evt.stopPropagation();
+      applyFileToInput(zone, firstImage);
+    },
+    true
+  );
+}
+"""
 
 
 def _norm_base(url: str) -> str:
@@ -546,6 +612,47 @@ def _resolve_paddleocr_python() -> Path:
     return candidates[0]
 
 
+def _build_paddle_subprocess_env(paddle_python: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    env.setdefault("PYTHONUTF8", "1")
+
+    try:
+        venv_root = paddle_python.resolve().parent.parent
+    except Exception:
+        venv_root = paddle_python.parent.parent
+    site_packages = venv_root / "Lib" / "site-packages"
+    nvidia_root = site_packages / "nvidia"
+
+    cuda_bin_dirs: list[str] = []
+    candidates = [
+        nvidia_root / "cu13" / "bin" / "x86_64",
+        nvidia_root / "cu13" / "bin",
+        nvidia_root / "cu12" / "bin" / "x86_64",
+        nvidia_root / "cu12" / "bin",
+    ]
+    if nvidia_root.exists():
+        candidates.extend(nvidia_root.glob("*/bin/x86_64"))
+        candidates.extend(nvidia_root.glob("*/bin"))
+
+    seen: set[str] = set()
+    for p in candidates:
+        try:
+            rp = str(p.resolve())
+        except Exception:
+            rp = str(p)
+        key = os.path.normcase(os.path.normpath(rp))
+        if key in seen:
+            continue
+        if os.path.isdir(rp):
+            seen.add(key)
+            cuda_bin_dirs.append(rp)
+
+    old_path = env.get("PATH", "")
+    if cuda_bin_dirs:
+        env["PATH"] = ";".join(cuda_bin_dirs + ([old_path] if old_path else []))
+    return env
+
+
 def _extract_ocr_text_via_subprocess(image_input: Any, ocr_lang: str) -> str:
     image_path = _resolve_image_path(image_input)
     if image_path is None:
@@ -597,8 +704,7 @@ for item in result:
             texts.append(val)
 print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_ascii=False))
 """
-    env = dict(os.environ)
-    env.setdefault("PYTHONUTF8", "1")
+    env = _build_paddle_subprocess_env(paddle_python)
     proc = subprocess.run(
         [str(paddle_python), "-c", script, str(image_path), lang],
         cwd=str(paddle_dir),
@@ -1641,6 +1747,7 @@ def build_app() -> gr.Blocks:
                     type="filepath",
                     sources=["upload"],
                     height=240,
+                    elem_id="ocr-image-drop",
                 )
                 with gr.Column():
                     ocr_lang = gr.Dropdown(
@@ -1946,6 +2053,13 @@ def build_app() -> gr.Blocks:
                 silence_sec,
             ],
             outputs=[rows_state, line_table, combined_audio, combined_file, current_lora_state, log_text],
+        )
+
+        demo.load(
+            fn=None,
+            inputs=[],
+            outputs=[],
+            js=_INIT_OCR_OVERWRITE_DROP_JS,
         )
 
     return demo
