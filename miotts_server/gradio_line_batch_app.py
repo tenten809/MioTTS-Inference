@@ -616,10 +616,21 @@ print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_asc
             payload_line = line[len(_OCR_JSON_MARKER) :].strip()
             break
     if not payload_line:
-        stderr_tail = "\n".join((proc.stderr or "").splitlines()[-8:]).strip()
-        stdout_tail = "\n".join((proc.stdout or "").splitlines()[-8:]).strip()
-        detail = stderr_tail or stdout_tail or f"exit={proc.returncode}"
-        raise RuntimeError(f"OCR subprocess failed: {detail}")
+        stderr_text = (proc.stderr or "").strip()
+        stdout_text = (proc.stdout or "").strip()
+        combined = f"{stderr_text}\n{stdout_text}"
+        if "No module named 'paddleocr'" in combined or 'No module named "paddleocr"' in combined:
+            raise RuntimeError(
+                "OCR subprocess failed: missing 'paddleocr' package in subprocess environment.\n"
+                f"python={paddle_python}\n"
+                f"cwd={paddle_dir}\n"
+                "install hint:\n"
+                f'  "{paddle_python}" -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/\n'
+                f'  "{paddle_python}" -m pip install -e "{paddle_dir}"'
+            )
+        tail_lines = "\n".join((stderr_text or stdout_text).splitlines()[-30:]).strip()
+        detail = tail_lines or f"exit={proc.returncode}"
+        raise RuntimeError(f"OCR subprocess failed (exit={proc.returncode}):\n{detail}")
 
     try:
         payload = json.loads(payload_line)
