@@ -692,6 +692,133 @@ def _build_paddle_subprocess_env(paddle_python: Path) -> dict[str, str]:
     return env
 
 
+_VERTICAL_RTL_LANGS = {"japan", "ch", "chinese_cht"}
+
+
+def _clean_ocr_texts(rec_texts: Any) -> list[str]:
+    if not isinstance(rec_texts, list):
+        return []
+    out: list[str] = []
+    for item in rec_texts:
+        text = str(item or "").strip()
+        if text:
+            out.append(text)
+    return out
+
+
+def _poly_to_box(poly: Any) -> tuple[float, float, float, float] | None:
+    if not isinstance(poly, (list, tuple)):
+        return None
+    xs: list[float] = []
+    ys: list[float] = []
+    for pt in poly:
+        if not isinstance(pt, (list, tuple)) or len(pt) < 2:
+            continue
+        try:
+            x = float(pt[0])
+            y = float(pt[1])
+        except Exception:
+            continue
+        xs.append(x)
+        ys.append(y)
+    if len(xs) < 2 or len(ys) < 2:
+        return None
+    x0 = min(xs)
+    x1 = max(xs)
+    y0 = min(ys)
+    y1 = max(ys)
+    w = max(1e-6, x1 - x0)
+    h = max(1e-6, y1 - y0)
+    cx = (x0 + x1) * 0.5
+    cy = (y0 + y1) * 0.5
+    return cx, cy, w, h
+
+
+def _build_ocr_items(rec_texts: Any, rec_polys: Any) -> list[dict[str, float | str]]:
+    texts = _clean_ocr_texts(rec_texts)
+    if not texts:
+        return []
+    if not isinstance(rec_polys, list):
+        return []
+    if len(rec_polys) != len(rec_texts):
+        return []
+
+    items: list[dict[str, float | str]] = []
+    for raw_text, poly in zip(rec_texts, rec_polys):
+        text = str(raw_text or "").strip()
+        if not text:
+            continue
+        box = _poly_to_box(poly)
+        if box is None:
+            continue
+        cx, cy, w, h = box
+        items.append({"text": text, "cx": cx, "cy": cy, "w": w, "h": h})
+    return items
+
+
+def _looks_vertical_layout(items: list[dict[str, float | str]]) -> bool:
+    if len(items) < 2:
+        return False
+    vertical_like = 0
+    for item in items:
+        w = float(item["w"])
+        h = float(item["h"])
+        if h >= w * 1.2:
+            vertical_like += 1
+    ratio = vertical_like / float(len(items))
+    return ratio >= 0.55
+
+
+def _reorder_vertical_rtl(items: list[dict[str, float | str]]) -> list[str]:
+    if not items:
+        return []
+
+    widths = sorted(float(item["w"]) for item in items if float(item["w"]) > 0)
+    median_w = widths[len(widths) // 2] if widths else 20.0
+    x_threshold = max(10.0, median_w * 1.6)
+
+    columns: list[dict[str, Any]] = []
+    for item in sorted(items, key=lambda x: float(x["cx"]), reverse=True):
+        cx = float(item["cx"])
+        best_idx = -1
+        best_dist = float("inf")
+        for idx, col in enumerate(columns):
+            dist = abs(cx - float(col["cx_mean"]))
+            if dist <= x_threshold and dist < best_dist:
+                best_idx = idx
+                best_dist = dist
+        if best_idx < 0:
+            columns.append({"cx_mean": cx, "items": [item]})
+            continue
+        col = columns[best_idx]
+        col["items"].append(item)
+        n = len(col["items"])
+        col["cx_mean"] = (float(col["cx_mean"]) * float(n - 1) + cx) / float(n)
+
+    columns.sort(key=lambda c: float(c["cx_mean"]), reverse=True)
+    ordered_lines: list[str] = []
+    for col in columns:
+        col_items = sorted(col["items"], key=lambda x: float(x["cy"]))
+        line = "".join(str(x["text"]) for x in col_items).strip()
+        if line:
+            ordered_lines.append(line)
+    return ordered_lines
+
+
+def _order_ocr_texts(rec_texts: Any, rec_polys: Any, lang: str) -> list[str]:
+    fallback = _clean_ocr_texts(rec_texts)
+    lang_norm = str(lang or "").strip().lower()
+    if lang_norm not in _VERTICAL_RTL_LANGS:
+        return fallback
+
+    items = _build_ocr_items(rec_texts, rec_polys)
+    if len(items) < 2 or not _looks_vertical_layout(items):
+        return fallback
+
+    reordered = _reorder_vertical_rtl(items)
+    return reordered or fallback
+
+
 def _extract_ocr_text_via_subprocess(image_input: Any, ocr_lang: str) -> tuple[str, str | None]:
     image_path = _resolve_image_path(image_input)
     if image_path is None:
@@ -722,7 +849,7 @@ ocr = PaddleOCR(
     use_textline_orientation=False,
 )
 result = ocr.predict(input=image_path)
-texts = []
+entries = []
 for item in result:
     payload = getattr(item, "json", None)
     if callable(payload):
@@ -738,11 +865,11 @@ for item in result:
     rec_texts = content.get("rec_texts")
     if not isinstance(rec_texts, list):
         continue
-    for text in rec_texts:
-        val = str(text or "").strip()
-        if val:
-            texts.append(val)
-print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_ascii=False))
+    rec_polys = content.get("rec_polys")
+    if not isinstance(rec_polys, list):
+        rec_polys = None
+    entries.append({"rec_texts": rec_texts, "rec_polys": rec_polys})
+print("__MIOTTS_OCR_JSON__=" + json.dumps({"entries": entries}, ensure_ascii=False))
 """
     env = _build_paddle_subprocess_env(paddle_python)
     proc = subprocess.run(
@@ -771,7 +898,7 @@ print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_asc
                 f"python={paddle_python}\n"
                 f"cwd={paddle_dir}\n"
                 "install hint:\n"
-                f'  "{paddle_python}" -m pip install paddlepaddle-gpu==3.2.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/\n'
+                f'  "{paddle_python}" -m pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/\n'
                 f'  "{paddle_python}" -m pip install -e "{paddle_dir}"'
             )
         tail_lines = "\n".join((stderr_text or stdout_text).splitlines()[-30:]).strip()
@@ -782,7 +909,22 @@ print("__MIOTTS_OCR_JSON__=" + json.dumps({"text": "\n".join(texts)}, ensure_asc
         payload = json.loads(payload_line)
     except Exception as exc:
         raise RuntimeError("OCR subprocess returned invalid JSON payload.") from exc
-    text = str(payload.get("text") or "").strip()
+    entries = payload.get("entries")
+    if not isinstance(entries, list):
+        raise RuntimeError("OCR subprocess returned no entries.")
+
+    ordered_texts: list[str] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        ordered_texts.extend(
+            _order_ocr_texts(
+                rec_texts=entry.get("rec_texts"),
+                rec_polys=entry.get("rec_polys"),
+                lang=lang,
+            )
+        )
+    text = "\n".join(x for x in ordered_texts if str(x).strip()).strip()
     if not text:
         raise RuntimeError("OCR returned no text.")
     return text, resize_note
