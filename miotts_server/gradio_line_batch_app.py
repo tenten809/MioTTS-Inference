@@ -285,6 +285,7 @@ async (selectedRow, cachedPayload, rows, adapters) => {
   return [selectedRow, text, rows, adapters];
 }
 """
+_ROWS_SNAPSHOT_TYPE = "miotts.rows.v1"
 _INIT_OCR_OVERWRITE_DROP_JS = r"""
 () => {
   if (window.__miottsOcrOverwriteDropRegistered) return;
@@ -1182,6 +1183,164 @@ def _rows_table(rows: list[dict[str, Any]], adapters: list[dict[str, Any]]) -> l
     return table
 
 
+def _resolve_uploaded_file_path(file_input: Any) -> Path | None:
+    if isinstance(file_input, Path):
+        path = file_input
+    elif isinstance(file_input, str):
+        path = Path(file_input)
+    elif isinstance(file_input, dict):
+        raw = file_input.get("path") or file_input.get("name")
+        if not raw:
+            return None
+        path = Path(str(raw))
+    elif hasattr(file_input, "name"):
+        try:
+            path = Path(str(file_input.name))
+        except Exception:
+            return None
+    else:
+        return None
+    try:
+        resolved = path.expanduser().resolve()
+    except Exception:
+        return None
+    if not resolved.exists() or not resolved.is_file():
+        return None
+    return resolved
+
+
+def _row_to_snapshot_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "text": str(row.get("text") or ""),
+        "lora_key": _parse_lora_key_from_table_cell(row.get("lora_key")),
+        "preset_id": str(row.get("preset_id") or ""),
+        "speech_rate": _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
+    }
+
+
+def _rows_from_snapshot_items(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for idx, item in enumerate(items, start=1):
+        text = ""
+        lora_key = None
+        preset_id = ""
+        speech_rate = DEFAULT_SPEECH_RATE
+
+        if isinstance(item, dict):
+            text = str(item.get("text") or "")
+            lora_key = _parse_lora_key_from_table_cell(item.get("lora_key") or item.get("lora"))
+            preset_id = str(item.get("preset_id") or item.get("preset") or "")
+            speech_rate = _normalize_speech_rate(item.get("speech_rate"), DEFAULT_SPEECH_RATE)
+        elif isinstance(item, (list, tuple)):
+            text = str(item[1] if len(item) > 1 else "")
+            lora_key = _parse_lora_key_from_table_cell(item[2] if len(item) > 2 else None)
+            preset_id = str(item[3] if len(item) > 3 else "")
+            speech_rate = _normalize_speech_rate(item[4] if len(item) > 4 else DEFAULT_SPEECH_RATE)
+        else:
+            continue
+
+        rows.append(
+            {
+                "idx": idx,
+                "text": text,
+                "lora_key": lora_key,
+                "preset_id": preset_id,
+                "speech_rate": speech_rate,
+                "status": "pending",
+                "audio_b64": None,
+                "cache_key": None,
+                "sample_rate": None,
+            }
+        )
+    return rows
+
+
+def _save_rows_snapshot(rows: list[dict[str, Any]]):
+    if not rows:
+        return None, "save rows: no rows"
+
+    payload = {
+        "type": _ROWS_SNAPSHOT_TYPE,
+        "version": 1,
+        "saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "rows": [_row_to_snapshot_item(row) for row in rows],
+    }
+    out_dir = Path("outputs/line_rows").resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ms = int((time.time() % 1.0) * 1000.0)
+    out_path = out_dir / f"tts_rows_{time.strftime('%Y%m%d_%H%M%S')}_{ms:03d}.json"
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(out_path), f"rows saved: {len(payload['rows'])} -> {out_path}"
+
+
+def _load_rows_snapshot(
+    file_input: Any,
+    selected_row: int,
+    current_rows: list[dict[str, Any]],
+    adapters: list[dict[str, Any]],
+    presets: list[str],
+):
+    existing_rows = current_rows if isinstance(current_rows, list) else []
+    fallback_selected = int(selected_row) if selected_row else (1 if existing_rows else 0)
+
+    def _fallback(msg: str):
+        row_text_val, row_lora_upd, row_preset_upd, row_rate = _load_row_settings(
+            fallback_selected,
+            existing_rows,
+            adapters,
+            presets,
+        )
+        return (
+            existing_rows,
+            _rows_table(existing_rows, adapters),
+            fallback_selected,
+            row_text_val,
+            row_lora_upd,
+            row_preset_upd,
+            row_rate,
+            msg,
+        )
+
+    path = _resolve_uploaded_file_path(file_input)
+    if path is None:
+        return _fallback("load rows: file not selected")
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return _fallback(f"load rows failed: invalid json - {exc}")
+
+    if isinstance(raw, dict):
+        items = raw.get("rows")
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = None
+    rows = _rows_from_snapshot_items(items)
+    if not rows:
+        return _fallback("load rows: no valid rows in file")
+
+    selected = 1
+    row_text_val, row_lora_upd, row_preset_upd, row_rate = _load_row_settings(
+        selected,
+        rows,
+        adapters,
+        presets,
+    )
+    return (
+        rows,
+        _rows_table(rows, adapters),
+        selected,
+        row_text_val,
+        row_lora_upd,
+        row_preset_upd,
+        row_rate,
+        f"rows loaded: {len(rows)} from {path}",
+    )
+
+
 def _global_cfg_signature(
     temperature: float,
     top_p: float,
@@ -2013,6 +2172,12 @@ def build_app() -> gr.Blocks:
             label="TTS Rows (scrollable)",
             elem_id="tts-rows-table",
         )
+        with gr.Accordion("Save / Load TTS Rows", open=False):
+            with gr.Row():
+                save_rows_btn = gr.Button("Save TTS Rows", variant="secondary")
+                load_rows_file = gr.File(label="Load TTS Rows JSON", file_types=[".json"], type="filepath")
+                load_rows_btn = gr.Button("Load TTS Rows", variant="secondary")
+                saved_rows_file = gr.File(label="Saved TTS Rows JSON")
         with gr.Row(elem_id="shortcut-controls"):
             copy_row_settings_shortcut = gr.Button("Copy Row Settings", elem_id="copy-row-settings-shortcut")
             paste_row_settings_shortcut = gr.Button("Paste Row Settings", elem_id="paste-row-settings-shortcut")
@@ -2029,7 +2194,6 @@ def build_app() -> gr.Blocks:
                 row_text = gr.Textbox(label="Selected Text", interactive=False)
             with gr.Column(scale=1):
                 settings_copy_btn = gr.Button("Settings Copy", variant="secondary", min_width=0)
-            with gr.Column(scale=1):
                 settings_paste_btn = gr.Button("Settings Paste", variant="secondary", min_width=0)
         with gr.Row():
             with gr.Column(scale=1):
@@ -2037,9 +2201,9 @@ def build_app() -> gr.Blocks:
             with gr.Column(scale=3):
                 pass
             with gr.Column(scale=1):
-                insert_row_btn = gr.Button("Insert Row Below", variant="secondary", min_width=0)
-            with gr.Column(scale=1):
                 delete_row_btn = gr.Button("Delete Selected Row", variant="secondary", min_width=0)
+            with gr.Column(scale=1):
+                insert_row_btn = gr.Button("Insert Row Below", variant="secondary", min_width=0)
         with gr.Row():
             row_lora = gr.Dropdown(
                 label=r"Row LoRA (from .\loras)",
@@ -2123,6 +2287,18 @@ def build_app() -> gr.Blocks:
             fn=_clear_cache,
             inputs=[rows_state, adapters_state],
             outputs=[rows_state, line_table, log_text],
+        )
+
+        save_rows_btn.click(
+            fn=_save_rows_snapshot,
+            inputs=[rows_state],
+            outputs=[saved_rows_file, log_text],
+        )
+
+        load_rows_btn.click(
+            fn=_load_rows_snapshot,
+            inputs=[load_rows_file, selected_row, rows_state, adapters_state, presets_state],
+            outputs=[rows_state, line_table, selected_row, row_text, row_lora, row_preset, row_speech_rate, log_text],
         )
 
         line_table.change(
