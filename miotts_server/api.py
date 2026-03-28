@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -22,6 +23,10 @@ from .codec import MioCodecService
 from .config import get_audio_config, get_config, get_llm_defaults
 from .llm_client import LLMClient
 from .schemas import (
+    BatchTTSItem,
+    BatchTTSItemResponse,
+    BatchTTSRequest,
+    BatchTTSResponse,
     BestOfNConfig,
     LLMParams,
     OutputConfig,
@@ -38,6 +43,29 @@ SPEECH_TOKEN_SYSTEM_PROMPT = (
     "You are a TTS token generator. "
     "Output only speech tokens in the exact format <|s_123|> with no extra text."
 )
+
+
+@dataclass
+class _ResolvedLLMSettings:
+    model: str
+    temperature: float
+    top_p: float
+    top_k: int | None
+    max_tokens: int
+    repetition_penalty: float
+    presence_penalty: float
+    frequency_penalty: float
+
+
+@dataclass
+class _PreparedBatchSynthesisItem:
+    index: int
+    normalized_text: str
+    global_embedding: torch.Tensor
+    speech_rate: float
+    llm_sec: float = 0.0
+    parse_sec: float = 0.0
+    token_candidates: list[list[int]] | None = None
 
 
 @asynccontextmanager
@@ -99,6 +127,14 @@ async def tts_json(request: TTSRequest):
     output_format = _resolve_output_format(request.output, default_format="base64")
     result = await _run_tts(request, output_format)
     return result
+
+
+@app.post("/v1/tts/batch")
+async def tts_batch_json(request: BatchTTSRequest):
+    output_format = _resolve_output_format(request.output, default_format="base64")
+    if output_format != "base64":
+        raise HTTPException(status_code=400, detail="batch endpoint supports only base64 output")
+    return await _run_tts_batch(request)
 
 
 @app.post("/v1/tts/file")
@@ -177,44 +213,12 @@ async def _run_tts(
     codec_service: MioCodecService = app.state.codec_service
     llm_client: LLMClient = app.state.llm_client
 
-    if not request.text:
-        raise HTTPException(status_code=400, detail="text is required")
-    if len(request.text) > config.max_text_length:
-        raise HTTPException(
-            status_code=400,
-            detail=f"text is too long (max {config.max_text_length} characters)",
-        )
-
-    detected_language = detect_language(request.text)
-    if detected_language == "ja":
-        normalized = normalize_text(request.text)
-    else:
-        normalized = request.text.strip()
-
-    llm_params = request.llm or LLMParams()
-    model = llm_params.model or config.llm_model
-    temperature = (
-        llm_params.temperature if llm_params.temperature is not None else llm_defaults.temperature
-    )
-    top_p = llm_params.top_p if llm_params.top_p is not None else llm_defaults.top_p
-    top_k = llm_params.top_k if llm_params.top_k is not None else llm_defaults.top_k
-    max_tokens = (
-        llm_params.max_tokens if llm_params.max_tokens is not None else llm_defaults.max_tokens
-    )
-    repetition_penalty = (
-        llm_params.repetition_penalty
-        if llm_params.repetition_penalty is not None
-        else llm_defaults.repetition_penalty
-    )
-    presence_penalty = (
-        llm_params.presence_penalty
-        if llm_params.presence_penalty is not None
-        else llm_defaults.presence_penalty
-    )
-    frequency_penalty = (
-        llm_params.frequency_penalty
-        if llm_params.frequency_penalty is not None
-        else llm_defaults.frequency_penalty
+    normalized = _normalize_text_for_tts(request.text, config)
+    llm_settings = await _resolve_llm_settings(
+        llm_params=request.llm,
+        config=config,
+        llm_defaults=llm_defaults,
+        llm_client=llm_client,
     )
     messages: list[dict[str, Any]] = [{"role": "user", "content": normalized}]
 
@@ -227,27 +231,19 @@ async def _run_tts(
         best_of_n.language,
     )
 
-    if not model:
-        try:
-            model = await llm_client.resolve_model(model)
-        except Exception as exc:
-            raise HTTPException(
-                status_code=500, detail=f"Failed to resolve LLM model: {exc}"
-            ) from exc
-
     t0 = time.perf_counter()
     try:
         llm_texts = await _fetch_llm_candidates(
             llm_client=llm_client,
             messages=messages,
-            model=model,
-            temperature=temperature,
-            top_p=top_p,
-            top_k=top_k,
-            max_tokens=max_tokens,
-            repetition_penalty=repetition_penalty,
-            presence_penalty=presence_penalty,
-            frequency_penalty=frequency_penalty,
+            model=llm_settings.model,
+            temperature=llm_settings.temperature,
+            top_p=llm_settings.top_p,
+            top_k=llm_settings.top_k,
+            max_tokens=llm_settings.max_tokens,
+            repetition_penalty=llm_settings.repetition_penalty,
+            presence_penalty=llm_settings.presence_penalty,
+            frequency_penalty=llm_settings.frequency_penalty,
             n=best_of_n.n if best_of_n.enabled else 1,
         )
     except Exception as exc:
@@ -266,14 +262,14 @@ async def _run_tts(
             llm_texts_retry = await _fetch_llm_candidates(
                 llm_client=llm_client,
                 messages=strict_messages,
-                model=model,
-                temperature=min(float(temperature), 0.4),
-                top_p=min(float(top_p), 0.95),
-                top_k=top_k,
-                max_tokens=max_tokens,
-                repetition_penalty=repetition_penalty,
-                presence_penalty=presence_penalty,
-                frequency_penalty=frequency_penalty,
+                model=llm_settings.model,
+                temperature=min(float(llm_settings.temperature), 0.4),
+                top_p=min(float(llm_settings.top_p), 0.95),
+                top_k=llm_settings.top_k,
+                max_tokens=llm_settings.max_tokens,
+                repetition_penalty=llm_settings.repetition_penalty,
+                presence_penalty=llm_settings.presence_penalty,
+                frequency_penalty=llm_settings.frequency_penalty,
                 n=best_of_n.n if best_of_n.enabled else 1,
             )
         except Exception as exc:
@@ -407,7 +403,7 @@ async def _run_tts(
 
     speech_rate = request.speech_rate if request.speech_rate is not None else 1.0
     if abs(float(speech_rate) - 1.0) > 1e-6:
-        audio = _apply_speech_rate(audio, float(speech_rate))
+        audio = _apply_speech_rate(audio, float(speech_rate), codec_sample_rate)
 
     t4 = time.perf_counter()
 
@@ -455,6 +451,211 @@ async def _run_tts(
         normalized_text=normalized,
     )
     return JSONResponse(content=response.model_dump())
+
+
+async def _run_tts_batch(request: BatchTTSRequest) -> JSONResponse:
+    config = get_config()
+    llm_defaults = get_llm_defaults()
+    codec_service: MioCodecService = app.state.codec_service
+    llm_client: LLMClient = app.state.llm_client
+    asr_service: ASRService | None = app.state.asr_service
+
+    best_of_n = _resolve_best_of_n(TTSRequest(text="batch-probe", best_of_n=request.best_of_n), config)
+
+    llm_settings = await _resolve_llm_settings(
+        llm_params=request.llm,
+        config=config,
+        llm_defaults=llm_defaults,
+        llm_client=llm_client,
+    )
+
+    responses: list[BatchTTSItemResponse] = [BatchTTSItemResponse(error="not processed")] * len(
+        request.items
+    )
+    prepared_items: list[_PreparedBatchSynthesisItem] = []
+
+    for idx, item in enumerate(request.items):
+        try:
+            normalized = _normalize_text_for_tts(item.text, config)
+            global_embedding = _resolve_batch_reference_embedding(item, codec_service)
+            speech_rate = item.speech_rate if item.speech_rate is not None else 1.0
+            responses[idx] = BatchTTSItemResponse(error=None)
+            prepared_items.append(
+                _PreparedBatchSynthesisItem(
+                    index=idx,
+                    normalized_text=normalized,
+                    global_embedding=global_embedding,
+                    speech_rate=float(speech_rate),
+                )
+            )
+        except HTTPException as exc:
+            responses[idx] = BatchTTSItemResponse(
+                error=f"request invalid: {_http_exception_detail_text(exc)}"
+            )
+        except Exception as exc:
+            responses[idx] = BatchTTSItemResponse(error=f"request invalid: {exc}")
+
+    async def _prepare_tokens(
+        item: _PreparedBatchSynthesisItem,
+    ) -> tuple[int, list[list[int]], float, float]:
+        token_candidates, llm_sec, parse_sec = await _generate_token_candidates_for_text(
+            normalized=item.normalized_text,
+            llm_client=llm_client,
+            llm_settings=llm_settings,
+            n=best_of_n.n if best_of_n.enabled else 1,
+        )
+        return item.index, token_candidates, llm_sec, parse_sec
+
+    if prepared_items:
+        token_results = await asyncio.gather(
+            *[_prepare_tokens(item) for item in prepared_items],
+            return_exceptions=True,
+        )
+
+        decodable_items: list[_PreparedBatchSynthesisItem] = []
+        by_index = {item.index: item for item in prepared_items}
+        for item, result in zip(prepared_items, token_results, strict=False):
+            if isinstance(result, Exception):
+                logger.warning("Batch token generation failed for item %d: %s", item.index, result)
+                responses[item.index] = BatchTTSItemResponse(error=f"token generation failed: {result}")
+                continue
+            row_index, token_candidates, llm_sec, parse_sec = result
+            prepared = by_index[row_index]
+            prepared.token_candidates = token_candidates
+            prepared.llm_sec = llm_sec
+            prepared.parse_sec = parse_sec
+            decodable_items.append(prepared)
+
+        if decodable_items:
+            codec_start = time.perf_counter()
+            try:
+                flat_tokens: list[list[int]] = []
+                flat_embeddings: list[torch.Tensor] = []
+                flat_item_indices: list[int] = []
+                for item in decodable_items:
+                    candidates = item.token_candidates or []
+                    for tokens in candidates:
+                        flat_tokens.append(tokens)
+                        flat_embeddings.append(item.global_embedding)
+                        flat_item_indices.append(item.index)
+                global_embeddings = torch.stack(flat_embeddings, dim=0)
+                audio_batch, audio_lengths = codec_service.synthesize_batch(
+                    flat_tokens,
+                    global_embedding=global_embeddings,
+                )
+            except Exception as exc:
+                logger.exception("Codec batch synthesis failed")
+                for item in decodable_items:
+                    responses[item.index] = BatchTTSItemResponse(
+                        error=f"codec batch synthesis failed: {exc}"
+                    )
+            else:
+                codec_end = time.perf_counter()
+                codec_total_sec = max(0.0, codec_end - codec_start)
+                codec_per_candidate_sec = codec_total_sec / max(1, len(flat_tokens))
+                lengths = (
+                    audio_lengths.tolist() if hasattr(audio_lengths, "tolist") else list(audio_lengths)
+                )
+                codec_sample_rate = codec_service.sample_rate
+                grouped_candidates: dict[int, list[BestOfNCandidate]] = {
+                    item.index: [] for item in decodable_items
+                }
+                flat_by_item: dict[int, int] = {item.index: 0 for item in decodable_items}
+
+                for batch_idx, item_index in enumerate(flat_item_indices):
+                    try:
+                        audio_len = int(lengths[batch_idx]) if lengths else audio_batch.shape[1]
+                        audio = audio_batch[batch_idx, :audio_len]
+                        item = by_index[item_index]
+                        candidate_idx = flat_by_item[item_index]
+                        flat_by_item[item_index] = candidate_idx + 1
+                        token_candidates = item.token_candidates or []
+                        grouped_candidates[item_index].append(
+                            BestOfNCandidate(
+                                tokens=token_candidates[candidate_idx],
+                                audio=audio,
+                            )
+                        )
+                    except Exception as exc:
+                        responses[item_index] = BatchTTSItemResponse(
+                            error=f"candidate decode mapping failed: {exc}"
+                        )
+
+                async def _finalize_item(
+                    item: _PreparedBatchSynthesisItem,
+                ) -> tuple[int, BatchTTSItemResponse]:
+                    candidates = grouped_candidates.get(item.index, [])
+                    if not candidates:
+                        return item.index, BatchTTSItemResponse(error="no decoded candidates")
+
+                    best_of_n_sec = None
+                    asr_sec = None
+                    selected = candidates[0]
+                    if best_of_n.enabled and len(candidates) > 1:
+                        if asr_service is None:
+                            return item.index, BatchTTSItemResponse(
+                                error="ASR is not available on the server"
+                            )
+                        rank_start = time.perf_counter()
+                        best_idx, asr_sec = await score_candidates(
+                            text=item.normalized_text,
+                            candidates=candidates,
+                            sample_rate=codec_sample_rate,
+                            language=best_of_n.language,
+                            asr_service=asr_service,
+                        )
+                        rank_end = time.perf_counter()
+                        best_of_n_sec = rank_end - rank_start
+                        if asr_sec is not None:
+                            best_of_n_sec = max(0.0, best_of_n_sec - asr_sec)
+                        selected = candidates[best_idx]
+
+                    post_start = time.perf_counter()
+                    audio = selected.audio
+                    if abs(float(item.speech_rate) - 1.0) > 1e-6:
+                        audio = _apply_speech_rate(audio, float(item.speech_rate), codec_sample_rate)
+                    post_end = time.perf_counter()
+                    item_codec_sec = codec_per_candidate_sec * max(1, len(candidates))
+                    total_sec = (
+                        item.llm_sec
+                        + item.parse_sec
+                        + item_codec_sec
+                        + (best_of_n_sec or 0.0)
+                        + (asr_sec or 0.0)
+                        + (post_end - post_start)
+                    )
+                    wav_bytes = write_wav_bytes(audio, codec_sample_rate)
+                    return item.index, BatchTTSItemResponse(
+                        audio=base64.b64encode(wav_bytes).decode("ascii"),
+                        format="base64",
+                        sample_rate=codec_sample_rate,
+                        token_count=len(selected.tokens),
+                        timings=TTSTimings(
+                            llm_sec=round(item.llm_sec, 4),
+                            parse_sec=round(item.parse_sec, 4),
+                            codec_sec=round(item_codec_sec, 4),
+                            total_sec=round(total_sec, 4),
+                            best_of_n_sec=round(best_of_n_sec, 4) if best_of_n_sec is not None else None,
+                            asr_sec=round(asr_sec, 4) if asr_sec is not None else None,
+                        ),
+                        normalized_text=item.normalized_text,
+                        error=None,
+                    )
+
+                finalized = await asyncio.gather(
+                    *[_finalize_item(item) for item in decodable_items],
+                    return_exceptions=True,
+                )
+                for item, result in zip(decodable_items, finalized, strict=False):
+                    if isinstance(result, Exception):
+                        responses[item.index] = BatchTTSItemResponse(
+                            error=f"finalize failed: {result}"
+                        )
+                        continue
+                    item_index, response = result
+                    responses[item_index] = response
+
+    return JSONResponse(content=BatchTTSResponse(items=responses).model_dump())
 
 
 @dataclass
@@ -553,6 +754,71 @@ async def _fetch_llm_candidates(
     return texts
 
 
+async def _generate_token_candidates_for_text(
+    normalized: str,
+    llm_client: LLMClient,
+    llm_settings: _ResolvedLLMSettings,
+    n: int,
+) -> tuple[list[list[int]], float, float]:
+    messages: list[dict[str, Any]] = [{"role": "user", "content": normalized}]
+    t0 = time.perf_counter()
+    llm_texts = await _fetch_llm_candidates(
+        llm_client=llm_client,
+        messages=messages,
+        model=llm_settings.model,
+        temperature=llm_settings.temperature,
+        top_p=llm_settings.top_p,
+        top_k=llm_settings.top_k,
+        max_tokens=llm_settings.max_tokens,
+        repetition_penalty=llm_settings.repetition_penalty,
+        presence_penalty=llm_settings.presence_penalty,
+        frequency_penalty=llm_settings.frequency_penalty,
+        n=n,
+    )
+    t1 = time.perf_counter()
+
+    tokens_list = _parse_llm_candidates(llm_texts)
+    if not tokens_list:
+        strict_messages = [
+            {"role": "system", "content": SPEECH_TOKEN_SYSTEM_PROMPT},
+            {"role": "user", "content": normalized},
+        ]
+        llm_texts_retry = await _fetch_llm_candidates(
+            llm_client=llm_client,
+            messages=strict_messages,
+            model=llm_settings.model,
+            temperature=min(float(llm_settings.temperature), 0.4),
+            top_p=min(float(llm_settings.top_p), 0.95),
+            top_k=llm_settings.top_k,
+            max_tokens=llm_settings.max_tokens,
+            repetition_penalty=llm_settings.repetition_penalty,
+            presence_penalty=llm_settings.presence_penalty,
+            frequency_penalty=llm_settings.frequency_penalty,
+            n=n,
+        )
+        t1 = time.perf_counter()
+        tokens_list = _parse_llm_candidates(llm_texts_retry)
+    if not tokens_list:
+        raise RuntimeError("No speech tokens found in LLM output.")
+    t2 = time.perf_counter()
+    return tokens_list, (t1 - t0), (t2 - t1)
+
+
+async def _generate_tokens_for_text(
+    normalized: str,
+    llm_client: LLMClient,
+    llm_settings: _ResolvedLLMSettings,
+    n: int,
+) -> tuple[list[int], float, float]:
+    token_candidates, llm_sec, parse_sec = await _generate_token_candidates_for_text(
+        normalized=normalized,
+        llm_client=llm_client,
+        llm_settings=llm_settings,
+        n=n,
+    )
+    return token_candidates[0], llm_sec, parse_sec
+
+
 async def _read_reference_file(file: UploadFile) -> bytes:
     config = get_config()
     audio_config = get_audio_config()
@@ -598,7 +864,159 @@ def _resolve_output_format(output: OutputConfig | None, default_format: str) -> 
     return default_format
 
 
-def _apply_speech_rate(audio: torch.Tensor, speech_rate: float) -> torch.Tensor:
+def _normalize_text_for_tts(text: str, config) -> str:
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+    if len(text) > config.max_text_length:
+        raise HTTPException(
+            status_code=400,
+            detail=f"text is too long (max {config.max_text_length} characters)",
+        )
+    detected_language = detect_language(text)
+    if detected_language == "ja":
+        return normalize_text(text)
+    return text.strip()
+
+
+async def _resolve_llm_settings(
+    llm_params: LLMParams | None,
+    config,
+    llm_defaults,
+    llm_client: LLMClient,
+) -> _ResolvedLLMSettings:
+    llm_params = llm_params or LLMParams()
+    model = llm_params.model or config.llm_model
+    temperature = (
+        llm_params.temperature if llm_params.temperature is not None else llm_defaults.temperature
+    )
+    top_p = llm_params.top_p if llm_params.top_p is not None else llm_defaults.top_p
+    top_k = llm_params.top_k if llm_params.top_k is not None else llm_defaults.top_k
+    max_tokens = (
+        llm_params.max_tokens if llm_params.max_tokens is not None else llm_defaults.max_tokens
+    )
+    repetition_penalty = (
+        llm_params.repetition_penalty
+        if llm_params.repetition_penalty is not None
+        else llm_defaults.repetition_penalty
+    )
+    presence_penalty = (
+        llm_params.presence_penalty
+        if llm_params.presence_penalty is not None
+        else llm_defaults.presence_penalty
+    )
+    frequency_penalty = (
+        llm_params.frequency_penalty
+        if llm_params.frequency_penalty is not None
+        else llm_defaults.frequency_penalty
+    )
+    if not model:
+        try:
+            model = await llm_client.resolve_model(model)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"Failed to resolve LLM model: {exc}"
+            ) from exc
+    return _ResolvedLLMSettings(
+        model=model,
+        temperature=temperature,
+        top_p=top_p,
+        top_k=top_k,
+        max_tokens=max_tokens,
+        repetition_penalty=repetition_penalty,
+        presence_penalty=presence_penalty,
+        frequency_penalty=frequency_penalty,
+    )
+
+
+def _resolve_batch_reference_embedding(
+    item: BatchTTSItem,
+    codec_service: MioCodecService,
+) -> torch.Tensor:
+    if item.reference is None:
+        raise HTTPException(status_code=400, detail="reference is required")
+    if item.reference.type != "preset":
+        raise HTTPException(
+            status_code=400,
+            detail="batch endpoint supports only preset references",
+        )
+    preset_id = item.reference.preset_id
+    if not preset_id:
+        raise HTTPException(status_code=400, detail="reference.preset_id is required")
+    try:
+        return codec_service.load_preset_embedding(preset_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+def _http_exception_detail_text(exc: HTTPException) -> str:
+    detail = exc.detail
+    if isinstance(detail, str):
+        return detail
+    return str(detail)
+
+
+def _largest_power_of_two_leq(value: int) -> int:
+    if value <= 0:
+        return 0
+    return 1 << (value.bit_length() - 1)
+
+
+def _select_time_stretch_n_fft(src_len: int, sample_rate: int) -> int:
+    target = 2048
+    if sample_rate > 0:
+        target = int(round(sample_rate * 0.046))
+    target = min(4096, max(256, target))
+    return _largest_power_of_two_leq(min(src_len, target))
+
+
+def _phase_vocoder_time_stretch(
+    complex_spec: torch.Tensor, speech_rate: float, hop_length: int
+) -> torch.Tensor:
+    frame_count = int(complex_spec.shape[-1])
+    if frame_count <= 1:
+        return complex_spec
+
+    complex_spec = torch.cat([complex_spec, complex_spec[..., -1:]], dim=-1)
+    real_dtype = complex_spec.real.dtype
+    time_steps = torch.arange(
+        0,
+        frame_count,
+        speech_rate,
+        device=complex_spec.device,
+        dtype=real_dtype,
+    )
+    if time_steps.numel() == 0:
+        time_steps = torch.zeros(1, device=complex_spec.device, dtype=real_dtype)
+
+    time_indices = torch.floor(time_steps).to(torch.long)
+    alphas = (time_steps - time_indices.to(real_dtype)).unsqueeze(0)
+
+    spec0 = complex_spec[..., time_indices]
+    spec1 = complex_spec[..., time_indices + 1]
+    magnitudes = (1.0 - alphas) * spec0.abs() + alphas * spec1.abs()
+
+    phase_advance = torch.linspace(
+        0.0,
+        math.pi * hop_length,
+        complex_spec.shape[-2],
+        device=complex_spec.device,
+        dtype=real_dtype,
+    ).unsqueeze(-1)
+    phase0 = torch.angle(spec0)
+    phase1 = torch.angle(spec1)
+    delta_phase = phase1 - phase0 - phase_advance
+    two_pi = 2.0 * math.pi
+    delta_phase = delta_phase - two_pi * torch.round(delta_phase / two_pi)
+    delta_phase = delta_phase + phase_advance
+
+    phase = torch.cat([phase0[..., :1], delta_phase[..., :-1]], dim=-1)
+    phase_acc = torch.cumsum(phase, dim=-1)
+    return torch.polar(magnitudes, phase_acc)
+
+
+def _apply_speech_rate(audio: torch.Tensor, speech_rate: float, sample_rate: int) -> torch.Tensor:
     if speech_rate <= 0:
         return audio
     audio = audio.float().flatten()
@@ -608,7 +1026,40 @@ def _apply_speech_rate(audio: torch.Tensor, speech_rate: float) -> torch.Tensor:
     dst_len = max(1, int(round(src_len / speech_rate)))
     if dst_len == src_len:
         return audio
-    return F.interpolate(audio.view(1, 1, -1), size=dst_len, mode="linear", align_corners=False).view(-1)
+
+    n_fft = _select_time_stretch_n_fft(src_len, sample_rate)
+    if n_fft < 64:
+        return F.interpolate(audio.view(1, 1, -1), size=dst_len, mode="linear", align_corners=False).view(-1)
+
+    hop_length = max(1, n_fft // 4)
+    window = torch.hann_window(n_fft, device=audio.device, dtype=audio.dtype)
+    complex_spec = torch.stft(
+        audio,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=n_fft,
+        window=window,
+        center=True,
+        return_complex=True,
+    )
+    stretched_spec = _phase_vocoder_time_stretch(complex_spec, speech_rate, hop_length)
+    stretched = torch.istft(
+        stretched_spec,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        win_length=n_fft,
+        window=window,
+        center=True,
+        length=dst_len,
+    )
+    if stretched.numel() != dst_len:
+        stretched = F.interpolate(
+            stretched.view(1, 1, -1),
+            size=dst_len,
+            mode="linear",
+            align_corners=False,
+        ).view(-1)
+    return stretched
 
 
 def _trim_reference(waveform: torch.Tensor, sample_rate: int, max_seconds: float) -> torch.Tensor:

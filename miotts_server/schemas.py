@@ -43,6 +43,19 @@ class TTSRequest(BaseModel):
     speech_rate: float | None = Field(default=None, ge=0.5, le=2.0)
 
 
+class BatchTTSItem(BaseModel):
+    text: str
+    reference: ReferenceConfig | None = None
+    speech_rate: float | None = Field(default=None, ge=0.5, le=2.0)
+
+
+class BatchTTSRequest(BaseModel):
+    items: list[BatchTTSItem] = Field(min_length=1, max_length=64)
+    llm: LLMParams | None = None
+    output: OutputConfig | None = None
+    best_of_n: BestOfNConfig | None = None
+
+
 class TTSTimings(BaseModel):
     llm_sec: float
     parse_sec: float
@@ -59,3 +72,17 @@ class TTSResponse(BaseModel):
     token_count: int
     timings: TTSTimings
     normalized_text: str
+
+
+class BatchTTSItemResponse(BaseModel):
+    audio: str | None = None
+    format: Literal["base64"] | None = None
+    sample_rate: int | None = None
+    token_count: int | None = None
+    timings: TTSTimings | None = None
+    normalized_text: str | None = None
+    error: str | None = None
+
+
+class BatchTTSResponse(BaseModel):
+    items: list[BatchTTSItemResponse]

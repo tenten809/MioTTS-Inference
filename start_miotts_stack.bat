@@ -42,6 +42,8 @@ set "ENABLE_BEST_OF_N=true"
 set "CODEC_MODEL=Aratako/MioCodec-25Hz-44.1kHz-v2"
 rem Optional: codec adapter safetensors path (relative to repo). Leave blank to disable.
 set "CODEC_ADAPTER="
+rem OCR resize cap (4K equivalent = 3840x2160)
+set "MIOTTS_OCR_MAX_PIXELS=8294400"
 
 rem Optional: set explicitly. Leave blank to auto-detect.
 set "LLAMA_SERVER_EXE="

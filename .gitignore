@@ -4,6 +4,7 @@ data/
 outputs/
 loras/
 PaddleOCR/
+ndlocr_lite_v1.1.0_windows/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

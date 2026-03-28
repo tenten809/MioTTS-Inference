@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import base64
+import atexit
 import csv
 import hashlib
 import io
 import json
 import os
+import queue
 import re
 import subprocess
 import sys
 import threading
 import time
 import unicodedata
+from collections import deque
 from pathlib import Path
 from typing import Any
 
@@ -25,22 +28,48 @@ DEFAULT_LLM_API_BASE = os.getenv("MIOTTS_LLM_BASE", "http://localhost:8000")
 DEFAULT_PRESETS_DIR = Path(os.getenv("MIOTTS_PRESETS_DIR", "presets")).expanduser()
 DEFAULT_LORAS_DIR = Path(os.getenv("MIOTTS_LORAS_DIR", "loras")).expanduser()
 DEFAULT_TEXT_REPLACE_CSV = Path(os.getenv("MIOTTS_TEXT_REPLACE_CSV", "text_replace_dict.csv")).expanduser()
-_DEFAULT_PADDLEOCR_DIR = Path(__file__).resolve().parent.parent / "PaddleOCR"
-DEFAULT_PADDLEOCR_DIR = Path(
-    os.getenv("MIOTTS_PADDLEOCR_DIR", str(_DEFAULT_PADDLEOCR_DIR))
+_DEFAULT_NDLOCR_DIR = Path(__file__).resolve().parent.parent / "ndlocr_lite_v1.1.0_windows"
+DEFAULT_NDLOCR_DIR = Path(
+    os.getenv(
+        "MIOTTS_NDLOCR_DIR",
+        os.getenv("MIOTTS_PADDLEOCR_DIR", str(_DEFAULT_NDLOCR_DIR)),  # backward-compatible fallback
+    )
 ).expanduser()
-DEFAULT_PADDLEOCR_PYTHON = Path(
-    os.getenv("MIOTTS_PADDLEOCR_PYTHON", str(DEFAULT_PADDLEOCR_DIR / ".venv" / "Scripts" / "python.exe"))
+DEFAULT_NDLOCR_PYTHON = Path(
+    os.getenv(
+        "MIOTTS_NDLOCR_PYTHON",
+        os.getenv("MIOTTS_PADDLEOCR_PYTHON", sys.executable),  # backward-compatible fallback
+    )
 ).expanduser()
-DEFAULT_PADDLEOCR_LANG = str(os.getenv("MIOTTS_PADDLEOCR_LANG", "japan")).strip() or "japan"
+DEFAULT_NDLOCR_LANG = str(
+    os.getenv("MIOTTS_NDLOCR_LANG", os.getenv("MIOTTS_PADDLEOCR_LANG", "japan"))
+).strip() or "japan"
 try:
     DEFAULT_OCR_MAX_PIXELS = max(1, int(float(os.getenv("MIOTTS_OCR_MAX_PIXELS", str(1920 * 1080)))))
 except Exception:
     DEFAULT_OCR_MAX_PIXELS = 1920 * 1080
+try:
+    DEFAULT_CONTINUOUS_TTS_PARALLEL = max(
+        1, int(float(os.getenv("MIOTTS_CONTINUOUS_TTS_PARALLEL", "8")))
+    )
+except Exception:
+    DEFAULT_CONTINUOUS_TTS_PARALLEL = 8
 NONE_LORA_VALUE = "__none__"
 PROCESS_LOCK = threading.Lock()
+_NDLOCR_WORKER_LOCK = threading.Lock()
+_NDLOCR_WORKER_STATE: dict[str, Any] = {
+    "proc": None,
+    "cfg": None,
+    "stderr_tail": deque(maxlen=200),
+    "stderr_thread": None,
+    "stdout_thread": None,
+    "stdout_queue": None,
+    "req_seq": 0,
+}
 UNKNOWN_LORA_STATE = {"id": "__unknown__", "scale": -1.0}
 _OCR_JSON_MARKER = "__MIOTTS_OCR_JSON__="
+_NDLOCR_WORKER_READY_MARKER = "__MIOTTS_NDLOCR_WORKER_READY__="
+_NDLOCR_WORKER_RESP_MARKER = "__MIOTTS_NDLOCR_WORKER_RESP__="
 _ASCII_TO_FULLWIDTH = str.maketrans({chr(i): chr(i + 0xFEE0) for i in range(33, 127)})
 _DAKUTEN_MARKS_RE = re.compile(r"[゛゜ﾞﾟ゙゚]")
 _DAKUTEN_WITH_SPACE_RE = re.compile(r"[ \t\u3000]*[゛゜ﾞﾟ゙゚]")
@@ -366,6 +395,10 @@ def _tts_url(api_base: str) -> str:
     return f"{_norm_base(api_base)}/v1/tts"
 
 
+def _tts_batch_url(api_base: str) -> str:
+    return f"{_norm_base(api_base)}/v1/tts/batch"
+
+
 def _lora_url(llm_base: str) -> str:
     return f"{_norm_base(llm_base)}/lora-adapters"
 
@@ -604,47 +637,155 @@ def _resolve_image_path(image_input: Any) -> Path | None:
     return resolved
 
 
-def _prepare_ocr_image(image_path: Path) -> tuple[Path, str | None]:
-    if DEFAULT_OCR_MAX_PIXELS <= 0:
-        return image_path, None
+def _normalize_ocr_preprocess_options(
+    *,
+    enabled: Any = False,
+    upscale: Any = 1.0,
+    contrast: Any = 1.0,
+    sharpness: Any = 1.0,
+    grayscale: Any = False,
+    autocontrast: Any = False,
+    denoise: Any = False,
+) -> dict[str, Any]:
+    def _to_float(v: Any, default: float) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return default
+
+    return {
+        "enabled": bool(enabled),
+        "upscale": min(4.0, max(1.0, _to_float(upscale, 1.0))),
+        "contrast": min(4.0, max(0.1, _to_float(contrast, 1.0))),
+        "sharpness": min(4.0, max(0.0, _to_float(sharpness, 1.0))),
+        "grayscale": bool(grayscale),
+        "autocontrast": bool(autocontrast),
+        "denoise": bool(denoise),
+    }
+
+
+def _preprocess_note_parts(opts: dict[str, Any]) -> list[str]:
+    if not bool(opts.get("enabled")):
+        return []
+    parts: list[str] = ["preproc"]
+    upscale = float(opts.get("upscale", 1.0))
+    contrast = float(opts.get("contrast", 1.0))
+    sharpness = float(opts.get("sharpness", 1.0))
+    if upscale > 1.001:
+        parts.append(f"x{upscale:.2f}".rstrip("0").rstrip("."))
+    if bool(opts.get("grayscale")):
+        parts.append("gray")
+    if bool(opts.get("autocontrast")):
+        parts.append("autoC")
+    if abs(contrast - 1.0) > 1e-3:
+        parts.append(f"ctr={contrast:.2f}".rstrip("0").rstrip("."))
+    if abs(sharpness - 1.0) > 1e-3:
+        parts.append(f"sharp={sharpness:.2f}".rstrip("0").rstrip("."))
+    if bool(opts.get("denoise")):
+        parts.append("median3")
+    return parts
+
+
+def _prepare_ocr_image(image_path: Path, preprocess_opts: dict[str, Any] | None = None) -> tuple[Path, str | None]:
+    opts = _normalize_ocr_preprocess_options(**(preprocess_opts or {}))
     try:
-        from PIL import Image, ImageOps
+        from PIL import Image, ImageEnhance, ImageFilter, ImageOps
     except Exception as exc:
-        raise RuntimeError("Pillow is required for OCR image resizing.") from exc
+        raise RuntimeError("Pillow is required for OCR image preprocessing.") from exc
 
     try:
         with Image.open(image_path) as img:
             img = ImageOps.exif_transpose(img)
+            orig_w, orig_h = img.size
+            notes: list[str] = []
+            changed = False
+
+            if bool(opts.get("enabled")):
+                upscale = float(opts.get("upscale", 1.0))
+                if upscale > 1.001:
+                    new_w = max(1, int(round(img.width * upscale)))
+                    new_h = max(1, int(round(img.height * upscale)))
+                    resampling = getattr(Image, "Resampling", Image)
+                    img = img.resize((new_w, new_h), resample=resampling.LANCZOS)
+                    changed = True
+
+                if bool(opts.get("grayscale")) and img.mode != "L":
+                    img = ImageOps.grayscale(img)
+                    changed = True
+                elif img.mode not in {"RGB", "RGBA", "L"}:
+                    img = img.convert("RGB")
+                    changed = True
+
+                if bool(opts.get("autocontrast")):
+                    img = ImageOps.autocontrast(img)
+                    changed = True
+
+                contrast = float(opts.get("contrast", 1.0))
+                if abs(contrast - 1.0) > 1e-3:
+                    img = ImageEnhance.Contrast(img).enhance(contrast)
+                    changed = True
+
+                if bool(opts.get("denoise")):
+                    img = img.filter(ImageFilter.MedianFilter(size=3))
+                    changed = True
+
+                sharpness = float(opts.get("sharpness", 1.0))
+                if abs(sharpness - 1.0) > 1e-3:
+                    img = ImageEnhance.Sharpness(img).enhance(sharpness)
+                    changed = True
+
+                note = " ".join(_preprocess_note_parts(opts)).strip()
+                if note:
+                    notes.append(note)
+
             width, height = img.size
             pixels = int(width) * int(height)
-            if pixels <= DEFAULT_OCR_MAX_PIXELS:
+            if DEFAULT_OCR_MAX_PIXELS > 0 and pixels > DEFAULT_OCR_MAX_PIXELS:
+                scale = (float(DEFAULT_OCR_MAX_PIXELS) / float(pixels)) ** 0.5
+                new_w = max(1, int(round(width * scale)))
+                new_h = max(1, int(round(height * scale)))
+                resampling = getattr(Image, "Resampling", Image)
+                img = img.resize((new_w, new_h), resample=resampling.LANCZOS)
+                notes.append(f"resized {width}x{height} -> {new_w}x{new_h}")
+                changed = True
+                width, height = new_w, new_h
+
+            if not changed:
                 return image_path, None
 
-            scale = (float(DEFAULT_OCR_MAX_PIXELS) / float(pixels)) ** 0.5
-            new_w = max(1, int(round(width * scale)))
-            new_h = max(1, int(round(height * scale)))
-            resampling = getattr(Image, "Resampling", Image)
-            resized = img.resize((new_w, new_h), resample=resampling.LANCZOS)
-            if resized.mode not in {"RGB", "RGBA", "L"}:
-                resized = resized.convert("RGB")
+            if img.mode not in {"RGB", "RGBA", "L"}:
+                img = img.convert("RGB")
 
-            out_dir = Path("outputs/ocr_resized").resolve()
+            out_dir = Path("outputs/ocr_prepared").resolve()
             out_dir.mkdir(parents=True, exist_ok=True)
-            digest_src = f"{image_path}:{image_path.stat().st_mtime_ns}:{width}x{height}:{DEFAULT_OCR_MAX_PIXELS}"
+            digest_src = json.dumps(
+                {
+                    "path": str(image_path),
+                    "mtime_ns": int(image_path.stat().st_mtime_ns),
+                    "orig_size": [orig_w, orig_h],
+                    "final_size": [width, height],
+                    "max_pixels": int(DEFAULT_OCR_MAX_PIXELS),
+                    "opts": opts,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            )
             digest = hashlib.sha1(digest_src.encode("utf-8")).hexdigest()[:12]
-            out_path = out_dir / f"{image_path.stem}_{new_w}x{new_h}_{digest}.png"
-            resized.save(out_path, format="PNG", optimize=True)
-            return out_path, f"resized {width}x{height} -> {new_w}x{new_h}"
+            out_path = out_dir / f"{image_path.stem}_{width}x{height}_{digest}.png"
+            img.save(out_path, format="PNG", optimize=True)
+            note_text = ", ".join(x for x in notes if str(x).strip()).strip() or None
+            return out_path, note_text
     except Exception as exc:
         raise RuntimeError(f"failed to prepare OCR image: {exc}") from exc
 
 
-def _resolve_paddleocr_python() -> Path:
+def _resolve_ndlocr_python() -> Path:
     candidates: list[Path] = []
-    env_python = str(os.getenv("MIOTTS_PADDLEOCR_PYTHON", "")).strip()
+    env_python = str(os.getenv("MIOTTS_NDLOCR_PYTHON", os.getenv("MIOTTS_PADDLEOCR_PYTHON", ""))).strip()
     if env_python:
         candidates.append(Path(env_python).expanduser())
-    candidates.append(DEFAULT_PADDLEOCR_PYTHON)
+    candidates.append(DEFAULT_NDLOCR_PYTHON)
+    candidates.append(Path(".venv") / "Scripts" / "python.exe")
     candidates.append(Path(sys.executable))
     for candidate in candidates:
         try:
@@ -656,44 +797,10 @@ def _resolve_paddleocr_python() -> Path:
     return candidates[0]
 
 
-def _build_paddle_subprocess_env(paddle_python: Path) -> dict[str, str]:
+def _build_ndlocr_subprocess_env(_: Path) -> dict[str, str]:
     env = dict(os.environ)
     env.setdefault("PYTHONUTF8", "1")
-
-    try:
-        venv_root = paddle_python.resolve().parent.parent
-    except Exception:
-        venv_root = paddle_python.parent.parent
-    site_packages = venv_root / "Lib" / "site-packages"
-    nvidia_root = site_packages / "nvidia"
-
-    cuda_bin_dirs: list[str] = []
-    candidates = [
-        nvidia_root / "cu13" / "bin" / "x86_64",
-        nvidia_root / "cu13" / "bin",
-        nvidia_root / "cu12" / "bin" / "x86_64",
-        nvidia_root / "cu12" / "bin",
-    ]
-    if nvidia_root.exists():
-        candidates.extend(nvidia_root.glob("*/bin/x86_64"))
-        candidates.extend(nvidia_root.glob("*/bin"))
-
-    seen: set[str] = set()
-    for p in candidates:
-        try:
-            rp = str(p.resolve())
-        except Exception:
-            rp = str(p)
-        key = os.path.normcase(os.path.normpath(rp))
-        if key in seen:
-            continue
-        if os.path.isdir(rp):
-            seen.add(key)
-            cuda_bin_dirs.append(rp)
-
-    old_path = env.get("PATH", "")
-    if cuda_bin_dirs:
-        env["PATH"] = ";".join(cuda_bin_dirs + ([old_path] if old_path else []))
+    env.setdefault("PYTHONIOENCODING", "utf-8")
     return env
 
 
@@ -849,121 +956,457 @@ def _order_ocr_texts(rec_texts: Any, rec_polys: Any, lang: str) -> list[str]:
     return reordered or fallback
 
 
-def _extract_ocr_text_via_subprocess(image_input: Any, ocr_lang: str) -> tuple[str, str | None]:
-    image_path = _resolve_image_path(image_input)
-    if image_path is None:
-        raise ValueError("OCR image is missing or invalid.")
-    input_for_ocr, resize_note = _prepare_ocr_image(image_path)
-
-    try:
-        paddle_dir = DEFAULT_PADDLEOCR_DIR.resolve()
-    except Exception as exc:
-        raise RuntimeError(f"invalid PaddleOCR directory: {DEFAULT_PADDLEOCR_DIR}") from exc
-    if not paddle_dir.exists():
-        raise RuntimeError(f"PaddleOCR directory not found: {paddle_dir}")
-
-    paddle_python = _resolve_paddleocr_python()
-    lang = str(ocr_lang or "").strip() or DEFAULT_PADDLEOCR_LANG
-    script = r"""
+_NDLOCR_WORKER_SCRIPT = r"""
+import contextlib
 import json
+import os
 import sys
+import traceback
+import zipfile
+from pathlib import Path
+from types import SimpleNamespace
 
-from paddleocr import PaddleOCR
+READY_MARKER = "__MIOTTS_NDLOCR_WORKER_READY__="
+RESP_MARKER = "__MIOTTS_NDLOCR_WORKER_RESP__="
 
-image_path = sys.argv[1]
-lang = sys.argv[2]
-ocr = PaddleOCR(
-    lang=lang,
-    use_doc_orientation_classify=False,
-    use_doc_unwarping=False,
-    use_textline_orientation=False,
-)
-result = ocr.predict(input=image_path)
-entries = []
-for item in result:
-    payload = getattr(item, "json", None)
-    if callable(payload):
+def _emit_ready(payload):
+    print(READY_MARKER + json.dumps(payload, ensure_ascii=False), flush=True)
+
+def _emit_resp(payload):
+    print(RESP_MARKER + json.dumps(payload, ensure_ascii=False), flush=True)
+
+def _extract_runtime_src(ndl_dir: Path, runtime_cache_dir: Path) -> Path:
+    app_zip = ndl_dir / "data" / "flutter_assets" / "app" / "app.zip"
+    src_dir = runtime_cache_dir / "src"
+    if src_dir.joinpath("ocr.py").exists():
+        return src_dir
+    runtime_cache_dir.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(app_zip) as zf:
+        for name in zf.namelist():
+            if not name.startswith("src/") or name.endswith("/"):
+                continue
+            zf.extract(name, path=runtime_cache_dir)
+    return src_dir
+
+def _build_args(src_dir: Path):
+    return SimpleNamespace(
+        det_weights=str(src_dir / "model" / "deim-s-1024x1024.onnx"),
+        det_classes=str(src_dir / "config" / "ndl.yaml"),
+        det_score_threshold=float(os.getenv("MIOTTS_NDLOCR_DET_SCORE_THRESHOLD", "0.2")),
+        det_conf_threshold=float(os.getenv("MIOTTS_NDLOCR_DET_CONF_THRESHOLD", "0.25")),
+        det_iou_threshold=float(os.getenv("MIOTTS_NDLOCR_DET_IOU_THRESHOLD", "0.2")),
+        rec_weights30=str(src_dir / "model" / "parseq-ndl-16x256-30-tiny-192epoch-tegaki3.onnx"),
+        rec_weights50=str(src_dir / "model" / "parseq-ndl-16x384-50-tiny-146epoch-tegaki2.onnx"),
+        rec_weights=str(src_dir / "model" / "parseq-ndl-16x768-100-tiny-165epoch-tegaki2.onnx"),
+        rec_classes=str(src_dir / "config" / "NDLmoji.yaml"),
+        device=str(os.getenv("MIOTTS_NDLOCR_DEVICE", "cpu")).strip() or "cpu",
+    )
+
+def _ocr_lines_for_image(image_path: str, detector, recognizer30, recognizer50, recognizer100, ocr_module, np_mod, ImageCls, ImageOpsMod, runtime_cache_dir: Path):
+    with ImageCls.open(image_path) as pil_image:
+        pil_image = ImageOpsMod.exif_transpose(pil_image).convert("RGB")
+        img = np_mod.array(pil_image)
+
+    img_h, img_w = img.shape[:2]
+    img_name = Path(image_path).name
+    with contextlib.redirect_stdout(sys.stderr):
+        detections, classeslist = ocr_module.process_detector(
+            detector=detector,
+            inputname=img_name,
+            npimage=img,
+            outputpath=str(runtime_cache_dir),
+            issaveimg=False,
+        )
+
+    resultobj = [dict(), dict()]
+    resultobj[0][0] = []
+    for i in range(len(classeslist)):
+        resultobj[1][i] = []
+    for det in detections:
+        xmin, ymin, xmax, ymax = det["box"]
+        conf = float(det.get("confidence", 0.0))
+        class_index = int(det["class_index"])
+        if class_index == 0:
+            resultobj[0][0].append([xmin, ymin, xmax, ymax])
+        resultobj[1].setdefault(class_index, []).append([xmin, ymin, xmax, ymax, conf])
+
+    xmlstr = ocr_module.convert_to_xml_string3(img_w, img_h, img_name, classeslist, resultobj)
+    root = ocr_module.ET.fromstring("<OCRDATASET>" + xmlstr + "</OCRDATASET>")
+    ocr_module.eval_xml(root, logger=None)
+
+    alllineobj = []
+    for idx, lineobj in enumerate(root.findall(".//LINE")):
+        xmin = int(lineobj.get("X"))
+        ymin = int(lineobj.get("Y"))
+        line_w = int(lineobj.get("WIDTH"))
+        line_h = int(lineobj.get("HEIGHT"))
         try:
-            payload = payload()
+            pred_char_cnt = float(lineobj.get("PRED_CHAR_CNT"))
         except Exception:
-            payload = None
-    if not isinstance(payload, dict):
-        continue
-    content = payload.get("res", payload)
-    if not isinstance(content, dict):
-        continue
-    rec_texts = content.get("rec_texts")
-    if not isinstance(rec_texts, list):
-        continue
-    rec_polys = content.get("rec_polys")
-    if not isinstance(rec_polys, list):
-        rec_polys = None
-    entries.append({"rec_texts": rec_texts, "rec_polys": rec_polys})
-print("__MIOTTS_OCR_JSON__=" + json.dumps({"entries": entries}, ensure_ascii=False))
+            pred_char_cnt = 100.0
+        lineimg = img[ymin:ymin + line_h, xmin:xmin + line_w, :]
+        alllineobj.append(ocr_module.RecogLine(lineimg, idx, pred_char_cnt))
+
+    if not alllineobj:
+        return []
+
+    return ocr_module.process_cascade(
+        alllineobj,
+        recognizer30=recognizer30,
+        recognizer50=recognizer50,
+        recognizer100=recognizer100,
+        is_cascade=True,
+    )
+
+def main():
+    ndl_dir = Path(sys.argv[1])
+    runtime_cache_dir = Path(sys.argv[2])
+    try:
+        src_dir = _extract_runtime_src(ndl_dir=ndl_dir, runtime_cache_dir=runtime_cache_dir)
+        sys.path.insert(0, str(ndl_dir / "site-packages"))
+        sys.path.insert(0, str(src_dir))
+        import numpy as np
+        from PIL import Image, ImageOps
+        import ocr
+
+        args = _build_args(src_dir)
+        detector = ocr.get_detector(args=args)
+        recognizer100 = ocr.get_recognizer(args=args)
+        recognizer30 = ocr.get_recognizer(args=args, weights_path=args.rec_weights30)
+        recognizer50 = ocr.get_recognizer(args=args, weights_path=args.rec_weights50)
+        _emit_ready({"ok": True})
+    except Exception as exc:
+        _emit_ready({"ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+        raise
+
+    for raw in sys.stdin:
+        raw = raw.strip()
+        if not raw:
+            continue
+        req_id = None
+        try:
+            req = json.loads(raw)
+            if not isinstance(req, dict):
+                raise ValueError("request must be a JSON object")
+            req_id = req.get("id")
+            image_path = str(req.get("image_path", "")).strip()
+            if not image_path:
+                raise ValueError("image_path is required")
+            _lang = str(req.get("lang", "")).strip()  # kept for protocol compatibility
+            lines = _ocr_lines_for_image(
+                image_path=image_path,
+                detector=detector,
+                recognizer30=recognizer30,
+                recognizer50=recognizer50,
+                recognizer100=recognizer100,
+                ocr_module=ocr,
+                np_mod=np,
+                ImageCls=Image,
+                ImageOpsMod=ImageOps,
+                runtime_cache_dir=runtime_cache_dir,
+            )
+            _emit_resp({"id": req_id, "ok": True, "lines": lines})
+        except Exception as exc:
+            _emit_resp({"id": req_id, "ok": False, "error": str(exc), "traceback": traceback.format_exc()})
+
+if __name__ == "__main__":
+    main()
 """
-    env = _build_paddle_subprocess_env(paddle_python)
-    proc = subprocess.run(
-        [str(paddle_python), "-c", script, str(input_for_ocr), lang],
-        cwd=str(paddle_dir),
-        capture_output=True,
+
+
+def _ndlocr_stderr_tail_text() -> str:
+    tail = _NDLOCR_WORKER_STATE.get("stderr_tail")
+    if not isinstance(tail, deque):
+        return ""
+    lines = [str(x) for x in tail if str(x).strip()]
+    return "\n".join(lines[-30:]).strip()
+
+
+def _terminate_ndlocr_worker_locked() -> None:
+    proc = _NDLOCR_WORKER_STATE.get("proc")
+    _NDLOCR_WORKER_STATE["proc"] = None
+    _NDLOCR_WORKER_STATE["cfg"] = None
+    _NDLOCR_WORKER_STATE["stdout_queue"] = None
+    _NDLOCR_WORKER_STATE["stdout_thread"] = None
+    _NDLOCR_WORKER_STATE["stderr_thread"] = None
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+                proc.wait(timeout=3)
+    except Exception:
+        pass
+    for stream_name in ("stdin", "stdout", "stderr"):
+        try:
+            stream = getattr(proc, stream_name, None)
+            if stream is not None:
+                stream.close()
+        except Exception:
+            pass
+
+
+def _shutdown_ndlocr_worker() -> None:
+    with _NDLOCR_WORKER_LOCK:
+        _terminate_ndlocr_worker_locked()
+
+
+def _ndlocr_stdout_reader(stream: Any, out_queue: queue.Queue[Any]) -> None:
+    try:
+        while True:
+            line = stream.readline()
+            if line == "":
+                break
+            out_queue.put(str(line).rstrip("\r\n"))
+    except Exception as exc:
+        out_queue.put(f"[stdout-reader-error] {type(exc).__name__}: {exc}")
+    finally:
+        out_queue.put(None)
+
+
+def _ndlocr_stderr_reader(stream: Any) -> None:
+    tail = _NDLOCR_WORKER_STATE.get("stderr_tail")
+    if not isinstance(tail, deque):
+        return
+    try:
+        while True:
+            line = stream.readline()
+            if line == "":
+                break
+            tail.append(str(line).rstrip("\r\n"))
+    except Exception as exc:
+        tail.append(f"[stderr-reader-error] {type(exc).__name__}: {exc}")
+
+
+def _wait_ndlocr_worker_marker_locked(marker: str, timeout_sec: float) -> dict[str, Any]:
+    q = _NDLOCR_WORKER_STATE.get("stdout_queue")
+    if not isinstance(q, queue.Queue):
+        raise RuntimeError("NDLOCR worker stdout queue is not available.")
+    deadline = time.time() + max(0.1, float(timeout_sec))
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            raise RuntimeError(f"NDLOCR worker timed out while waiting for {marker}.")
+        try:
+            line = q.get(timeout=remaining)
+        except queue.Empty as exc:
+            raise RuntimeError(f"NDLOCR worker timed out while waiting for {marker}.") from exc
+        if line is None:
+            raise RuntimeError("NDLOCR worker exited before sending a response.")
+        text = str(line).strip()
+        if not text:
+            continue
+        if text.startswith(marker):
+            payload_text = text[len(marker) :].strip()
+            try:
+                payload = json.loads(payload_text)
+            except Exception as exc:
+                raise RuntimeError("NDLOCR worker returned invalid JSON payload.") from exc
+            if not isinstance(payload, dict):
+                raise RuntimeError("NDLOCR worker returned non-object JSON payload.")
+            return payload
+        # Keep unexpected stdout in the tail for diagnostics.
+        tail = _NDLOCR_WORKER_STATE.get("stderr_tail")
+        if isinstance(tail, deque):
+            tail.append(f"[stdout] {text}")
+
+
+def _raise_ndlocr_worker_error(detail: str, ndl_python: Path, ndl_site_packages: Path) -> None:
+    combined = str(detail or "").strip()
+    if "No module named 'onnxruntime'" in combined or 'No module named "onnxruntime"' in combined:
+        raise RuntimeError(
+            "OCR subprocess failed: missing 'onnxruntime' in subprocess environment.\n"
+            f"python={ndl_python}\n"
+            "This feature expects a Python 3.12 environment and loads onnxruntime from "
+            f"`{ndl_site_packages}`."
+        )
+    if "DLL load failed" in combined or "cannot import name 'onnxruntime_pybind11_state'" in combined:
+        raise RuntimeError(
+            "OCR subprocess failed to load NDLOCR-Lite runtime libraries. "
+            "The subprocess Python may be incompatible with the bundled packages "
+            f"(expected Python 3.12). python={ndl_python}"
+        )
+    raise RuntimeError(f"OCR subprocess failed:\n{combined or 'unknown error'}")
+
+
+def _ensure_ndlocr_worker_locked(ndl_python: Path, ndl_dir: Path, runtime_cache_dir: Path, ndl_site_packages: Path) -> subprocess.Popen[str]:
+    cfg = (
+        str(ndl_python),
+        str(ndl_dir),
+        str(runtime_cache_dir),
+        str(ndl_site_packages),
+    )
+    proc = _NDLOCR_WORKER_STATE.get("proc")
+    current_cfg = _NDLOCR_WORKER_STATE.get("cfg")
+    if proc is not None and proc.poll() is None and current_cfg == cfg:
+        return proc
+
+    _terminate_ndlocr_worker_locked()
+    tail = _NDLOCR_WORKER_STATE.get("stderr_tail")
+    if isinstance(tail, deque):
+        tail.clear()
+    out_queue: queue.Queue[Any] = queue.Queue()
+
+    env = _build_ndlocr_subprocess_env(ndl_python)
+    proc = subprocess.Popen(
+        [str(ndl_python), "-u", "-c", _NDLOCR_WORKER_SCRIPT, str(ndl_dir), str(runtime_cache_dir)],
+        cwd=str(ndl_dir),
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=600,
+        bufsize=1,
         env=env,
     )
 
-    payload_line = ""
-    for line in reversed((proc.stdout or "").splitlines()):
-        if line.startswith(_OCR_JSON_MARKER):
-            payload_line = line[len(_OCR_JSON_MARKER) :].strip()
-            break
-    if not payload_line:
-        stderr_text = (proc.stderr or "").strip()
-        stdout_text = (proc.stdout or "").strip()
-        combined = f"{stderr_text}\n{stdout_text}"
-        if "No module named 'paddleocr'" in combined or 'No module named "paddleocr"' in combined:
-            raise RuntimeError(
-                "OCR subprocess failed: missing 'paddleocr' package in subprocess environment.\n"
-                f"python={paddle_python}\n"
-                f"cwd={paddle_dir}\n"
-                "install hint:\n"
-                f'  "{paddle_python}" -m pip install paddlepaddle-gpu==3.3.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu126/\n'
-                f'  "{paddle_python}" -m pip install -e "{paddle_dir}"'
-            )
-        tail_lines = "\n".join((stderr_text or stdout_text).splitlines()[-30:]).strip()
-        detail = tail_lines or f"exit={proc.returncode}"
-        raise RuntimeError(f"OCR subprocess failed (exit={proc.returncode}):\n{detail}")
+    stdout_thread = threading.Thread(
+        target=_ndlocr_stdout_reader,
+        args=(proc.stdout, out_queue),
+        name="ndlocr-worker-stdout",
+        daemon=True,
+    )
+    stderr_thread = threading.Thread(
+        target=_ndlocr_stderr_reader,
+        args=(proc.stderr,),
+        name="ndlocr-worker-stderr",
+        daemon=True,
+    )
+    stdout_thread.start()
+    stderr_thread.start()
+
+    _NDLOCR_WORKER_STATE["proc"] = proc
+    _NDLOCR_WORKER_STATE["cfg"] = cfg
+    _NDLOCR_WORKER_STATE["stdout_queue"] = out_queue
+    _NDLOCR_WORKER_STATE["stdout_thread"] = stdout_thread
+    _NDLOCR_WORKER_STATE["stderr_thread"] = stderr_thread
+
+    ready = _wait_ndlocr_worker_marker_locked(_NDLOCR_WORKER_READY_MARKER, timeout_sec=240.0)
+    if not bool(ready.get("ok")):
+        detail = str(ready.get("traceback") or ready.get("error") or "").strip()
+        _terminate_ndlocr_worker_locked()
+        _raise_ndlocr_worker_error(detail, ndl_python=ndl_python, ndl_site_packages=ndl_site_packages)
+    return proc
+
+
+def _request_ndlocr_worker_lines(image_path: Path, lang: str, ndl_python: Path, ndl_dir: Path, runtime_cache_dir: Path, ndl_site_packages: Path) -> list[str]:
+    last_exc: Exception | None = None
+    for attempt in range(2):
+        try:
+            with _NDLOCR_WORKER_LOCK:
+                proc = _ensure_ndlocr_worker_locked(
+                    ndl_python=ndl_python,
+                    ndl_dir=ndl_dir,
+                    runtime_cache_dir=runtime_cache_dir,
+                    ndl_site_packages=ndl_site_packages,
+                )
+                stdin = proc.stdin
+                if stdin is None:
+                    raise RuntimeError("NDLOCR worker stdin is unavailable.")
+                _NDLOCR_WORKER_STATE["req_seq"] = int(_NDLOCR_WORKER_STATE.get("req_seq", 0)) + 1
+                req_id = int(_NDLOCR_WORKER_STATE["req_seq"])
+                req = {"id": req_id, "image_path": str(image_path), "lang": str(lang or "")}
+                stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
+                stdin.flush()
+                payload = _wait_ndlocr_worker_marker_locked(_NDLOCR_WORKER_RESP_MARKER, timeout_sec=600.0)
+                if int(payload.get("id") or -1) != req_id:
+                    raise RuntimeError("NDLOCR worker response id mismatch.")
+                if not bool(payload.get("ok")):
+                    detail = str(payload.get("traceback") or payload.get("error") or "").strip()
+                    _raise_ndlocr_worker_error(detail, ndl_python=ndl_python, ndl_site_packages=ndl_site_packages)
+                lines = payload.get("lines")
+                if not isinstance(lines, list):
+                    raise RuntimeError("NDLOCR worker returned no line list.")
+                return [str(x) for x in lines]
+        except Exception as exc:
+            last_exc = exc
+            with _NDLOCR_WORKER_LOCK:
+                _terminate_ndlocr_worker_locked()
+            if attempt >= 1:
+                break
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("NDLOCR worker request failed.")
+
+
+atexit.register(_shutdown_ndlocr_worker)
+
+
+def _extract_ocr_text_via_subprocess(
+    image_input: Any,
+    ocr_lang: str,
+    preprocess_opts: dict[str, Any] | None = None,
+) -> tuple[str, str | None]:
+    image_path = _resolve_image_path(image_input)
+    if image_path is None:
+        raise ValueError("OCR image is missing or invalid.")
+    input_for_ocr, resize_note = _prepare_ocr_image(image_path, preprocess_opts=preprocess_opts)
 
     try:
-        payload = json.loads(payload_line)
+        ndl_dir = DEFAULT_NDLOCR_DIR.resolve()
     except Exception as exc:
-        raise RuntimeError("OCR subprocess returned invalid JSON payload.") from exc
-    entries = payload.get("entries")
-    if not isinstance(entries, list):
-        raise RuntimeError("OCR subprocess returned no entries.")
+        raise RuntimeError(f"invalid NDLOCR-Lite directory: {DEFAULT_NDLOCR_DIR}") from exc
+    if not ndl_dir.exists():
+        raise RuntimeError(f"NDLOCR-Lite directory not found: {ndl_dir}")
 
-    ordered_texts: list[str] = []
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        ordered_texts.extend(
-            _order_ocr_texts(
-                rec_texts=entry.get("rec_texts"),
-                rec_polys=entry.get("rec_polys"),
-                lang=lang,
-            )
-        )
-    text = "\n".join(x for x in ordered_texts if str(x).strip()).strip()
+    app_zip = ndl_dir / "data" / "flutter_assets" / "app" / "app.zip"
+    ndl_site_packages = ndl_dir / "site-packages"
+    if not app_zip.exists():
+        raise RuntimeError(f"NDLOCR-Lite app.zip not found: {app_zip}")
+    if not ndl_site_packages.exists():
+        raise RuntimeError(f"NDLOCR-Lite site-packages not found: {ndl_site_packages}")
+
+    ndl_python = _resolve_ndlocr_python()
+    lang = str(ocr_lang or "").strip() or DEFAULT_NDLOCR_LANG
+    runtime_cache_dir = Path("outputs/ndlocr_runtime_cache").resolve()
+    runtime_cache_dir.mkdir(parents=True, exist_ok=True)
+    lines = _request_ndlocr_worker_lines(
+        image_path=input_for_ocr,
+        lang=lang,
+        ndl_python=ndl_python,
+        ndl_dir=ndl_dir,
+        runtime_cache_dir=runtime_cache_dir,
+        ndl_site_packages=ndl_site_packages,
+    )
+    text = "\n".join(str(x).strip() for x in lines if str(x).strip()).strip()
     if not text:
         raise RuntimeError("OCR returned no text.")
     return text, resize_note
 
 
-def _fill_long_text_from_ocr(image_input: Any, current_long_text: str, ocr_lang: str):
+def _fill_long_text_from_ocr(
+    image_input: Any,
+    current_long_text: str,
+    ocr_lang: str,
+    ocr_preproc_enable: bool,
+    ocr_preproc_upscale: float,
+    ocr_preproc_contrast: float,
+    ocr_preproc_sharpness: float,
+    ocr_preproc_grayscale: bool,
+    ocr_preproc_autocontrast: bool,
+    ocr_preproc_denoise: bool,
+):
     current = str(current_long_text or "")
+    preprocess_opts = _normalize_ocr_preprocess_options(
+        enabled=ocr_preproc_enable,
+        upscale=ocr_preproc_upscale,
+        contrast=ocr_preproc_contrast,
+        sharpness=ocr_preproc_sharpness,
+        grayscale=ocr_preproc_grayscale,
+        autocontrast=ocr_preproc_autocontrast,
+        denoise=ocr_preproc_denoise,
+    )
     try:
-        text, resize_note = _extract_ocr_text_via_subprocess(image_input=image_input, ocr_lang=ocr_lang)
+        text, resize_note = _extract_ocr_text_via_subprocess(
+            image_input=image_input,
+            ocr_lang=ocr_lang,
+            preprocess_opts=preprocess_opts,
+        )
     except Exception as exc:
         return current, f"ocr failed: {exc}"
     msg = f"ocr ok: {len(text)} chars loaded into Long Text Input"
@@ -1464,6 +1907,82 @@ def _call_tts(
     return _audio_from_b64(audio_b64)
 
 
+def _call_tts_batch(
+    api_base: str,
+    batch_rows: list[dict[str, Any]],
+    temperature: float,
+    top_p: float,
+    top_k: int,
+    max_tokens: int,
+    repetition_penalty: float,
+    presence_penalty: float,
+    frequency_penalty: float,
+    best_of_n_enabled: bool,
+    best_of_n_n: int,
+    best_of_n_language: str,
+) -> list[tuple[int, np.ndarray] | Exception]:
+    llm_payload: dict[str, Any] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+        "repetition_penalty": repetition_penalty,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+    }
+    if int(top_k) > 0:
+        llm_payload["top_k"] = int(top_k)
+
+    items_payload: list[dict[str, Any]] = []
+    for row in batch_rows:
+        preset_id = row.get("preset_id")
+        if not preset_id:
+            raise ValueError("preset is required for each row.")
+        items_payload.append(
+            {
+                "text": row["text"],
+                "reference": {"type": "preset", "preset_id": preset_id},
+                "speech_rate": _normalize_speech_rate(row.get("speech_rate"), DEFAULT_SPEECH_RATE),
+            }
+        )
+
+    payload: dict[str, Any] = {
+        "items": items_payload,
+        "llm": llm_payload,
+        "output": {"format": "base64"},
+    }
+    if best_of_n_enabled:
+        payload["best_of_n"] = {
+            "enabled": True,
+            "n": int(best_of_n_n),
+            "language": best_of_n_language,
+        }
+
+    res = httpx.post(_tts_batch_url(api_base), json=payload, timeout=240.0)
+    res.raise_for_status()
+    data = res.json()
+    items = data.get("items")
+    if not isinstance(items, list):
+        raise RuntimeError("No items in /v1/tts/batch response.")
+    if len(items) != len(batch_rows):
+        raise RuntimeError("Mismatched item count in /v1/tts/batch response.")
+
+    results: list[tuple[int, np.ndarray] | Exception] = []
+    for item in items:
+        if not isinstance(item, dict):
+            results.append(RuntimeError("Invalid batch response item."))
+            continue
+        error = str(item.get("error") or "").strip()
+        if error:
+            results.append(RuntimeError(error))
+            continue
+        audio_b64 = item.get("audio")
+        if not audio_b64:
+            results.append(RuntimeError("No audio in /v1/tts/batch item response."))
+            continue
+        results.append(_audio_from_b64(audio_b64))
+    return results
+
+
 def _format_tts_error(exc: Exception) -> str:
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code if exc.response is not None else "?"
@@ -1494,6 +2013,60 @@ def _resample_linear(audio: np.ndarray, src_sr: int, dst_sr: int) -> np.ndarray:
     x_src = np.linspace(0.0, 1.0, num=n_src, endpoint=True, dtype=np.float32)
     x_dst = np.linspace(0.0, 1.0, num=n_dst, endpoint=True, dtype=np.float32)
     return np.interp(x_dst, x_src, audio).astype(np.float32)
+
+
+def _normalize_parallel_tts_requests(value: Any) -> int:
+    try:
+        parallel = int(value)
+    except Exception:
+        parallel = DEFAULT_CONTINUOUS_TTS_PARALLEL
+    return max(1, min(16, parallel))
+
+
+def _chunked_row_indices(indices: list[int], chunk_size: int) -> list[list[int]]:
+    size = max(1, int(chunk_size))
+    return [indices[i : i + size] for i in range(0, len(indices), size)]
+
+
+def _continuous_tts_group_key(row: dict[str, Any]) -> tuple[int, str]:
+    lora_key = _parse_lora_key_from_table_cell(row.get("lora_key"))
+    if not lora_key:
+        return (0, "")
+    return (1, str(lora_key))
+
+
+def _build_continuous_tts_plan(
+    rows: list[dict[str, Any]],
+    global_sig: str,
+    lora_scale: float,
+) -> tuple[list[tuple[str | None, list[int]]], int]:
+    pending: list[tuple[tuple[int, str], int, str | None]] = []
+    total_new = 0
+
+    for row_index, row in enumerate(rows):
+        cache_key = _row_cache_key(row=row, global_sig=global_sig, lora_scale=lora_scale)
+        if row.get("audio_b64") and row.get("cache_key") == cache_key:
+            row["status"] = "cached"
+            continue
+        row["status"] = "pending"
+        pending.append((_continuous_tts_group_key(row), row_index, row.get("lora_key")))
+        total_new += 1
+
+    pending.sort(key=lambda item: (item[0], item[1]))
+
+    grouped: list[tuple[str | None, list[int]]] = []
+    current_lora_key: str | None = None
+    current_indices: list[int] = []
+    for _, row_index, lora_key in pending:
+        if current_indices and lora_key != current_lora_key:
+            grouped.append((current_lora_key, current_indices))
+            current_indices = []
+        current_lora_key = lora_key
+        current_indices.append(row_index)
+    if current_indices:
+        grouped.append((current_lora_key, current_indices))
+
+    return grouped, total_new
 
 
 def _refresh_refs(llm_base: str):
@@ -1967,6 +2540,7 @@ def _process_all_rows(
     best_of_n_language: str,
     lora_scale: float,
     silence_sec: float,
+    parallel_tts_requests: int,
 ):
     if not rows:
         return rows, _rows_table(rows, adapters), None, None, current_lora_state, "no rows"
@@ -1985,19 +2559,17 @@ def _process_all_rows(
             best_of_n_language=best_of_n_language,
         )
 
-        missing_by_lora: dict[str | None, list[int]] = {}
-        for i, row in enumerate(rows):
-            cache_key = _row_cache_key(row=row, global_sig=global_sig, lora_scale=lora_scale)
-            if row.get("audio_b64") and row.get("cache_key") == cache_key:
-                row["status"] = "cached"
-                continue
-            row["status"] = "pending"
-            missing_by_lora.setdefault(row.get("lora_key"), []).append(i)
+        synthesis_groups, total_new = _build_continuous_tts_plan(
+            rows=rows,
+            global_sig=global_sig,
+            lora_scale=lora_scale,
+        )
+        parallel_requests = _normalize_parallel_tts_requests(parallel_tts_requests)
+        logs = [
+            f"rows={len(rows)}, synth_new={total_new}, groups={len(synthesis_groups)}, parallel={parallel_requests}, reorder=original"
+        ]
 
-        total_new = sum(len(v) for v in missing_by_lora.values())
-        logs = [f"rows={len(rows)}, synth_new={total_new}, groups={len(missing_by_lora)}"]
-
-        for lora_key, indices in missing_by_lora.items():
+        for lora_key, indices in synthesis_groups:
             try:
                 lora_id = _resolve_lora_id(adapters=adapters, lora_key=lora_key)
             except ValueError as exc:
@@ -2009,14 +2581,17 @@ def _process_all_rows(
             if active_lora != lora_id or abs(active_scale - target_scale) > 1e-9:
                 _apply_lora(llm_base=llm_base, adapters=adapters, target_lora_id=lora_id, lora_scale=lora_scale)
                 current_lora_state = {"id": lora_id, "scale": target_scale}
-            logs.append(f"lora={lora_key or 'none'} rows={len(indices)}")
+            group_batch_size = min(parallel_requests, len(indices))
+            logs.append(
+                f"lora={lora_key or 'none'} rows={len(indices)} batch_size={group_batch_size}"
+            )
 
-            for i in indices:
-                row = rows[i]
+            for chunk in _chunked_row_indices(indices, group_batch_size):
+                batch_rows = [rows[row_index] for row_index in chunk]
                 try:
-                    sr, audio = _call_tts(
+                    batch_results = _call_tts_batch(
                         api_base=api_base,
-                        row=row,
+                        batch_rows=batch_rows,
                         temperature=temperature,
                         top_p=top_p,
                         top_k=int(top_k),
@@ -2029,16 +2604,31 @@ def _process_all_rows(
                         best_of_n_language=best_of_n_language,
                     )
                 except Exception as exc:
-                    row["status"] = "error"
-                    row["audio_b64"] = None
-                    row["sample_rate"] = None
-                    row["cache_key"] = None
-                    logs.append(f"row {row['idx']}: tts failed - {_format_tts_error(exc)}")
+                    logs.append(
+                        f"batch rows={len(chunk)} failed - {_format_tts_error(exc)}"
+                    )
+                    for row_index in chunk:
+                        row = rows[row_index]
+                        row["status"] = "error"
+                        row["audio_b64"] = None
+                        row["sample_rate"] = None
+                        row["cache_key"] = None
                     continue
-                row["audio_b64"] = _audio_to_b64(sr, audio)
-                row["sample_rate"] = sr
-                row["cache_key"] = _row_cache_key(row=row, global_sig=global_sig, lora_scale=lora_scale)
-                row["status"] = "done"
+
+                for row_index, result in zip(chunk, batch_results, strict=False):
+                    row = rows[row_index]
+                    if isinstance(result, Exception):
+                        row["status"] = "error"
+                        row["audio_b64"] = None
+                        row["sample_rate"] = None
+                        row["cache_key"] = None
+                        logs.append(f"row {row['idx']}: tts failed - {_format_tts_error(result)}")
+                        continue
+                    sr, audio = result
+                    row["audio_b64"] = _audio_to_b64(sr, audio)
+                    row["sample_rate"] = sr
+                    row["cache_key"] = _row_cache_key(row=row, global_sig=global_sig, lora_scale=lora_scale)
+                    row["status"] = "done"
 
         combined_chunks: list[np.ndarray] = []
         out_sr = None
@@ -2113,7 +2703,7 @@ def build_app() -> gr.Blocks:
 
         refresh_msg = gr.Markdown()
 
-        with gr.Accordion("Image OCR (PaddleOCR subprocess)", open=False):
+        with gr.Accordion("Image OCR (NDLOCR-Lite subprocess)", open=False):
             with gr.Row():
                 ocr_image = gr.Image(
                     label="Drop Image For OCR",
@@ -2125,13 +2715,39 @@ def build_app() -> gr.Blocks:
                 with gr.Column():
                     ocr_lang = gr.Dropdown(
                         label="OCR Language",
-                        choices=["japan", "ch", "en"],
-                        value=DEFAULT_PADDLEOCR_LANG,
+                        choices=["japan"],
+                        value=DEFAULT_NDLOCR_LANG,
                         allow_custom_value=True,
+                    )
+                    ocr_preproc_enable = gr.Checkbox(label="Enable OCR Preprocess", value=False)
+                    with gr.Row():
+                        ocr_preproc_grayscale = gr.Checkbox(label="Grayscale", value=True)
+                        ocr_preproc_autocontrast = gr.Checkbox(label="Auto Contrast", value=True)
+                        ocr_preproc_denoise = gr.Checkbox(label="Denoise (Median)", value=False)
+                    ocr_preproc_upscale = gr.Slider(
+                        1.0,
+                        4.0,
+                        value=1.5,
+                        step=0.25,
+                        label="Preprocess Upscale",
+                    )
+                    ocr_preproc_contrast = gr.Slider(
+                        0.5,
+                        3.0,
+                        value=0.7,
+                        step=0.1,
+                        label="Preprocess Contrast",
+                    )
+                    ocr_preproc_sharpness = gr.Slider(
+                        0.0,
+                        3.0,
+                        value=1.1,
+                        step=0.1,
+                        label="Preprocess Sharpness",
                     )
                     ocr_btn = gr.Button("Read Text From Image")
                     gr.Markdown(
-                        f"Uses subprocess: `{DEFAULT_PADDLEOCR_PYTHON}` (cwd: `{DEFAULT_PADDLEOCR_DIR}`)"
+                        f"Uses persistent subprocess: `{DEFAULT_NDLOCR_PYTHON}` (NDLOCR dir: `{DEFAULT_NDLOCR_DIR}`)"
                     )
 
         with gr.Row():
@@ -2250,6 +2866,13 @@ def build_app() -> gr.Blocks:
                     choices=["auto", "ja", "en"], value="auto", label="Language"
                 )
                 silence_sec = gr.Slider(0.0, 2.0, value=0.2, step=0.05, label="Line Silence (sec)")
+                parallel_tts_requests = gr.Slider(
+                    1,
+                    16,
+                    value=DEFAULT_CONTINUOUS_TTS_PARALLEL,
+                    step=1,
+                    label="Continuous TTS Parallel Requests",
+                )
 
         with gr.Row():
             process_row_btn = gr.Button("Process Selected Row And Play")
@@ -2283,7 +2906,18 @@ def build_app() -> gr.Blocks:
 
         ocr_btn.click(
             fn=_fill_long_text_from_ocr,
-            inputs=[ocr_image, long_text, ocr_lang],
+            inputs=[
+                ocr_image,
+                long_text,
+                ocr_lang,
+                ocr_preproc_enable,
+                ocr_preproc_upscale,
+                ocr_preproc_contrast,
+                ocr_preproc_sharpness,
+                ocr_preproc_grayscale,
+                ocr_preproc_autocontrast,
+                ocr_preproc_denoise,
+            ],
             outputs=[long_text, log_text],
         )
 
@@ -2441,6 +3075,7 @@ def build_app() -> gr.Blocks:
                 best_of_n_language,
                 lora_scale,
                 silence_sec,
+                parallel_tts_requests,
             ],
             outputs=[rows_state, line_table, combined_audio, combined_file, current_lora_state, log_text],
         )
